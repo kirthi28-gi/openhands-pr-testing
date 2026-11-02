@@ -13,6 +13,7 @@ permissions:
 jobs:
   pr-review:
     if: |
+      github.event_name == 'workflow_dispatch' ||
       (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
       github.event.action == 'ready_for_review' ||
       github.event.label.name == 'review-this' ||
