@@ -12,6 +12,10 @@ permissions:
 
 jobs:
   pr-review:
+      permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
