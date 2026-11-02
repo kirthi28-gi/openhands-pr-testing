@@ -36,6 +36,7 @@ class SafeEvaluator:
             "cos": lambda x: math.cos(math.radians(x)),
             "tan": lambda x: math.tan(math.radians(x)),
             "abs": lambda x: x if x >= 0 else x,
+            "ceil": lambda x: int(x) + 1,
             "sqrt": math.sqrt,
             "log": math.log,
         }
