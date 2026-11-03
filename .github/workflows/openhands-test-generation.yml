@@ -21,12 +21,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
-      - name: Checkout automation scripts
-        uses: actions/checkout@v4
-        with:
-          ref: baseline
-          path: automation
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -65,7 +59,7 @@ jobs:
 
           PR_DIFF_FILE: ${{ github.workspace }}/pr.diff
 
-        run: python automation/.github/scripts/generate_tests.py
+        run: python .github/scripts/generate_tests.py
 
       - name: Upload generated tests
         if: always()
