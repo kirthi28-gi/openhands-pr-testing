@@ -138,6 +138,7 @@ def main():
 
             # Install project dependencies inside the sandbox.
             install_command = """
+cd /workspace
 python -m pip install --upgrade pip pytest
 
 if [ -f requirements.txt ]; then
@@ -213,7 +214,7 @@ Do not stop after describing the tests. Create the files.
 
             # Run the complete existing and newly generated test suite.
             test_result = workspace.execute_command(
-                "python -m pytest -q",
+                "cd /workspace && python -m pytest -q",
                 timeout=900,
             )
 
@@ -227,8 +228,9 @@ Do not stop after describing the tests. Create the files.
             run_checked(
                 workspace,
                 """
-mkdir -p tests/generated
-tar -czf generated-tests.tar.gz tests/generated
+cd /workspace
+mkdir -p /workspace/tests/generated
+tar -czf /workspace/generated-tests.tar.gz -C /workspace tests/generated
 """,
             )
 
