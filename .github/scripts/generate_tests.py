@@ -78,13 +78,15 @@ def main():
 
     llm = LLM(
         usage_id="pr-test-generation",
-        model=os.getenv("LLM_MODEL", "openai/gpt-4.1"),
+        model=os.getenv("LLM_MODEL", "gpt-6-luna"),
         api_key=SecretStr(api_key),
         base_url=os.getenv(
             "LLM_BASE_URL",
-            "https://openrouter.ai/api/v1",
+            "https://api.openai.com/v1",
         ),
         max_output_tokens=3000,
+        reasoning_effort="none",
+        num_retries=0,
     )
 
     machine = platform.machine().lower()
