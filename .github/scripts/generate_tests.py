@@ -163,6 +163,8 @@ fi
             conversation = Conversation(
                 agent=agent,
                 workspace=workspace,
+                max_iteration_per_run=10,
+                max_budget_per_run=0.10,
             )
 
             prompt = f"""
