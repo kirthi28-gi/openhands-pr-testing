@@ -47,7 +47,7 @@ jobs:
       - name: Generate and execute tests in OpenHands sandbox
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_MODEL: openrouter/free
+          LLM_MODEL: openai/gpt-4.1
           LLM_BASE_URL: https://openrouter.ai/api/v1
 
           PR_TITLE: ${{ github.event.pull_request.title }}

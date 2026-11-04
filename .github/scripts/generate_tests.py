@@ -78,7 +78,7 @@ def main():
 
     llm = LLM(
         usage_id="pr-test-generation",
-        model=os.getenv("LLM_MODEL", "openrouter/free"),
+        model=os.getenv("LLM_MODEL", "openai/gpt-4.1"),
         api_key=SecretStr(api_key),
         base_url=os.getenv(
             "LLM_BASE_URL",
