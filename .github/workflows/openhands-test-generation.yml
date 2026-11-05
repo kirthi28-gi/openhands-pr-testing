@@ -48,6 +48,34 @@ jobs:
             openhands-workspace \
             openhands-agent-server
 
+          python -m pip show openhands-sdk openhands-tools openhands-workspace openhands-agent-server
+
+      - name: Inspect OpenHands conversation API
+        run: |
+          python - <<'PYCODE'
+          import inspect
+          from importlib.metadata import version
+          from openhands.sdk import Conversation
+
+          packages = [
+              "openhands-sdk",
+              "openhands-tools",
+              "openhands-workspace",
+              "openhands-agent-server",
+          ]
+
+          for package in packages:
+              print(f"{package}: {version(package)}")
+
+          print("\\nConversation API:")
+          for method_name in ["send_message", "run", "close"]:
+              method = getattr(Conversation, method_name, None)
+              if method is None:
+                  print(f"{method_name}: NOT FOUND")
+              else:
+                  print(f"{method_name}: {inspect.signature(method)}")
+          PYCODE
+
       - name: Generate and execute tests in OpenHands sandbox
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
