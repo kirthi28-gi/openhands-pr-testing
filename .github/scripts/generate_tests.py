@@ -139,6 +139,8 @@ def main():
             # Install project dependencies inside the sandbox.
             install_command = """
 cd /workspace
+sudo -n apt-get update
+sudo -n apt-get install -y libtk8.6
 python -m pip install --upgrade pip pytest
 
 if [ -f requirements.txt ]; then
