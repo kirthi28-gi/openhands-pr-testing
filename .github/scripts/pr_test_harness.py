@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shlex
 import tarfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 
@@ -642,6 +643,282 @@ def sandbox_test_command(command: str) -> str:
     ])
 
 
+def generated_tests_manifest_from_archive(archive_path: Path) -> dict:
+    """Validate and fingerprint a generated-tests tar without extracting it."""
+    if archive_path.stat().st_size > 100 * 1024 * 1024:
+        raise ValueError("Generated-test snapshot archive exceeds 100 MiB")
+    manifest = {}
+    root_found = False
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        if len(members) > 1000:
+            raise ValueError("Generated-test snapshot contains too many entries")
+        total_size = 0
+        for member in members:
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts or path.parts[:2] != ("tests", "generated"):
+                raise ValueError(f"Unsafe generated-test archive path: {member.name}")
+            if not (member.isdir() or member.isfile()):
+                raise ValueError(f"Unsupported generated-test archive entry: {member.name}")
+            if member.issym() or member.islnk():
+                raise ValueError(f"Links are not allowed in generated tests: {member.name}")
+            if member.mode & 0o7000:
+                raise ValueError(f"Special permissions are not allowed in generated tests: {member.name}")
+            total_size += member.size
+            if total_size > 100 * 1024 * 1024:
+                raise ValueError("Generated-test snapshot exceeds 100 MiB uncompressed")
+            if path.parts == ("tests", "generated"):
+                root_found = member.isdir()
+            if "__pycache__" in path.parts or path.suffix == ".pyc":
+                continue
+            key = path.as_posix().rstrip("/")
+            if key in manifest:
+                raise ValueError(f"Duplicate generated-test archive entry: {member.name}")
+            value = {"type": "directory" if member.isdir() else "file", "mode": member.mode & 0o777}
+            if member.isfile():
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise ValueError(f"Could not read generated test: {member.name}")
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                value["sha256"] = digest.hexdigest()
+            manifest[key] = value
+    if not root_found:
+        raise ValueError("Generated-test archive has no tests/generated directory")
+    return manifest
+
+
+def capture_generated_tests_snapshot(workspace, archive_path: Path) -> dict:
+    """Save generated tests outside the agent workspace as the trusted baseline."""
+    archive_in_workspace = "/tmp/openhands-generated-tests-snapshot.tar.gz"
+    captured = workspace.execute_command(
+        f"rm -f {archive_in_workspace} && "
+        f"tar -czf {archive_in_workspace} -C /workspace tests/generated",
+        timeout=120,
+    )
+    if captured.exit_code != 0:
+        raise RuntimeError(f"Could not snapshot generated tests: {captured.stderr or captured.stdout}")
+    download = workspace.file_download(
+        source_path=archive_in_workspace,
+        destination_path=str(archive_path),
+    )
+    if not download.success:
+        raise RuntimeError(f"Could not download generated-test snapshot: {download.error}")
+    return generated_tests_manifest_from_archive(archive_path)
+
+
+_REPOSITORY_TEST_CAPTURE_COMMAND = (
+    "find /workspace "
+    "-type d \\( -name .git -o -name node_modules -o -name .venv "
+    "-o -name __pycache__ -o -name target -o -name build -o -name dist "
+    "-o -path /workspace/tests/generated \\) -prune -o "
+    "-type f \\( -path '*/tests/*' -o -path '*/test/*' "
+    "-o -path '*/__tests__/*' -o -path '*/src/test/*' "
+    "-o -name 'test_*.py' -o -name '*_test.py' "
+    "-o -name '*.test.*' -o -name '*.spec.*' \\) -printf '%P\\0' | "
+    "tar -czf /tmp/openhands-repository-tests.tar.gz "
+    "-C /workspace --null -T -"
+)
+_REPOSITORY_TEST_DELETE_COMMAND = (
+    "find /workspace "
+    "-type d \\( -name .git -o -name node_modules -o -name .venv "
+    "-o -name __pycache__ -o -name target -o -name build -o -name dist "
+    "-o -path /workspace/tests/generated \\) -prune -o "
+    "-type f \\( -path '*/tests/*' -o -path '*/test/*' "
+    "-o -path '*/__tests__/*' -o -path '*/src/test/*' "
+    "-o -name 'test_*.py' -o -name '*_test.py' "
+    "-o -name '*.test.*' -o -name '*.spec.*' \\) -delete"
+)
+
+
+def repository_test_manifest_from_archive(archive_path: Path) -> dict:
+    """Fingerprint conventional existing repository tests without extracting them."""
+    if archive_path.stat().st_size > 100 * 1024 * 1024:
+        raise ValueError("Repository-test snapshot archive exceeds 100 MiB")
+    manifest = {}
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        if len(members) > 5000:
+            raise ValueError("Repository-test snapshot contains too many entries")
+        total_size = 0
+        for member in members:
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or not path.parts or ".." in path.parts:
+                raise ValueError(f"Unsafe repository-test archive path: {member.name}")
+            if not member.isfile() or member.issym() or member.islnk():
+                raise ValueError(f"Unsupported repository-test archive entry: {member.name}")
+            total_size += member.size
+            if total_size > 100 * 1024 * 1024:
+                raise ValueError("Repository-test snapshot exceeds 100 MiB uncompressed")
+            if "__pycache__" in path.parts or path.suffix == ".pyc":
+                continue
+            key = path.as_posix()
+            if key in manifest:
+                raise ValueError(f"Duplicate repository-test archive entry: {member.name}")
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise ValueError(f"Could not read repository test: {member.name}")
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            manifest[key] = {"mode": member.mode & 0o777, "sha256": digest.hexdigest()}
+    return manifest
+
+
+def capture_repository_tests_snapshot(workspace, archive_path: Path) -> dict:
+    captured = workspace.execute_command(_REPOSITORY_TEST_CAPTURE_COMMAND, timeout=120)
+    if captured.exit_code != 0:
+        raise RuntimeError(f"Could not snapshot repository tests: {captured.stderr or captured.stdout}")
+    download = workspace.file_download(
+        source_path="/tmp/openhands-repository-tests.tar.gz",
+        destination_path=str(archive_path),
+    )
+    if not download.success:
+        raise RuntimeError(f"Could not download repository-test snapshot: {download.error}")
+    return repository_test_manifest_from_archive(archive_path)
+
+
+def ensure_repository_tests_unchanged(workspace, snapshot_archive: Path, expected_manifest: dict, scratch_archive: Path) -> dict:
+    """Detect and restore changes to existing tests, removing newly added test files too."""
+    errors = []
+    try:
+        captured = workspace.execute_command(_REPOSITORY_TEST_CAPTURE_COMMAND, timeout=120)
+        if captured.exit_code != 0:
+            raise RuntimeError(captured.stderr or captured.stdout or "could not capture repository tests")
+        download = workspace.file_download(
+            source_path="/tmp/openhands-repository-tests.tar.gz",
+            destination_path=str(scratch_archive),
+        )
+        if not download.success:
+            raise RuntimeError(f"could not download repository tests: {download.error}")
+        actual_manifest = repository_test_manifest_from_archive(scratch_archive)
+    except Exception as exc:
+        actual_manifest = {}
+        errors.append(f"Could not verify repository tests: {type(exc).__name__}: {exc}")
+    changed_paths = sorted(
+        path for path in set(expected_manifest) | set(actual_manifest)
+        if expected_manifest.get(path) != actual_manifest.get(path)
+    )
+    unchanged = not errors and not changed_paths
+    restored = False
+    if not unchanged:
+        upload = workspace.file_upload(
+            source_path=str(snapshot_archive),
+            destination_path="/tmp/openhands-repository-tests-trusted.tar.gz",
+        )
+        if not upload.success:
+            errors.append(f"Could not restore trusted repository tests: {upload.error}")
+        else:
+            restore = workspace.execute_command(
+                _REPOSITORY_TEST_DELETE_COMMAND
+                + " && tar --no-same-owner --same-permissions "
+                "-xzf /tmp/openhands-repository-tests-trusted.tar.gz -C /workspace",
+                timeout=120,
+            )
+            if restore.exit_code != 0:
+                errors.append(f"Could not restore repository tests: {restore.stderr or restore.stdout}")
+            else:
+                try:
+                    restored_manifest = capture_repository_tests_snapshot(workspace, scratch_archive)
+                    restored = restored_manifest == expected_manifest
+                    if not restored:
+                        errors.append("Restored repository-test snapshot does not match the trusted snapshot.")
+                except Exception as exc:
+                    errors.append(f"Could not verify restored repository tests: {type(exc).__name__}: {exc}")
+    return {"unchanged": unchanged, "changed_paths": changed_paths, "errors": errors, "restored": restored}
+
+
+def ensure_generated_tests_unchanged(
+    workspace,
+    snapshot_archive: Path,
+    expected_manifest: dict,
+    scratch_archive: Path,
+    allow_additions: bool = False,
+) -> dict:
+    """Compare workspace tests with the host snapshot and restore tampering."""
+    current_archive = "/tmp/openhands-generated-tests-current.tar.gz"
+    errors = []
+    actual_manifest = None
+    try:
+        captured = workspace.execute_command(
+            f"rm -f {current_archive} && "
+            f"tar -czf {current_archive} -C /workspace tests/generated",
+            timeout=120,
+        )
+        if captured.exit_code != 0:
+            raise RuntimeError(captured.stderr or captured.stdout or "could not capture generated tests")
+        download = workspace.file_download(
+            source_path=current_archive,
+            destination_path=str(scratch_archive),
+        )
+        if not download.success:
+            raise RuntimeError(f"could not download current generated tests: {download.error}")
+        actual_manifest = generated_tests_manifest_from_archive(scratch_archive)
+    except Exception as exc:
+        errors.append(f"Could not verify generated tests: {type(exc).__name__}: {exc}")
+
+    actual_manifest = actual_manifest or {}
+    changed_paths = sorted(
+        path for path in set(expected_manifest) | set(actual_manifest)
+        if expected_manifest.get(path) != actual_manifest.get(path)
+        and not (allow_additions and path not in expected_manifest)
+    )
+    unchanged = not errors and not changed_paths
+    if not allow_additions:
+        unchanged = unchanged and actual_manifest == expected_manifest
+    restored = False
+    if not unchanged:
+        upload = workspace.file_upload(
+            source_path=str(snapshot_archive),
+            destination_path="/tmp/openhands-generated-tests-snapshot.tar.gz",
+        )
+        if not upload.success:
+            errors.append(f"Could not restore trusted generated tests: {upload.error}")
+        else:
+            restore = workspace.execute_command(
+                "rm -rf /workspace/tests/generated && "
+                "tar --no-same-owner --same-permissions "
+                "-xzf /tmp/openhands-generated-tests-snapshot.tar.gz -C /workspace",
+                timeout=120,
+            )
+            if restore.exit_code == 0:
+                recapture = workspace.execute_command(
+                    f"rm -f {current_archive} && "
+                    f"tar -czf {current_archive} -C /workspace tests/generated",
+                    timeout=120,
+                )
+                redownload = workspace.file_download(
+                    source_path=current_archive,
+                    destination_path=str(scratch_archive),
+                ) if recapture.exit_code == 0 else None
+                if redownload and redownload.success:
+                    try:
+                        restored_manifest = generated_tests_manifest_from_archive(scratch_archive)
+                        restored = restored_manifest == expected_manifest
+                        if not restored:
+                            restore_mismatches = sorted(
+                                path for path in set(expected_manifest) | set(restored_manifest)
+                                if expected_manifest.get(path) != restored_manifest.get(path)
+                            )
+                            errors.append(
+                                "Restored generated-test snapshot differs at: "
+                                + ", ".join(restore_mismatches)
+                            )
+                    except Exception as exc:
+                        errors.append(f"Could not verify restored generated tests: {type(exc).__name__}: {exc}")
+                if not restored:
+                    errors.append("Trusted generated-test snapshot restoration could not be verified.")
+            else:
+                errors.append(f"Could not restore trusted generated tests: {restore.stderr or restore.stdout}")
+    return {
+        "unchanged": unchanged,
+        "changed_paths": changed_paths,
+        "errors": errors,
+        "restored": restored,
+    }
+
+
 def load_agent_report(path: Path, attempts: list[dict]) -> dict:
     """Load and cross-check agent diagnoses against captured command output."""
     errors: list[str] = []
@@ -976,6 +1253,8 @@ def ensure_failure_artifacts(output_dir: Path, error_name: str) -> tuple[Path, P
         and report.get("report_validation_errors") == []
     )
     report.setdefault("harness_result", report.get("result", "not run"))
+    if not isinstance(report.get("repair_history"), list):
+        report["repair_history"] = []
     report.update({
         "schema_version": 1,
         "result": "failed",
@@ -1045,6 +1324,23 @@ def ensure_failure_artifacts(output_dir: Path, error_name: str) -> tuple[Path, P
         report["proposed_patches"] = []
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+    if not (output_dir / "openhands-application.patch").exists():
+        (output_dir / "openhands-application.patch").write_text("", encoding="utf-8")
+    repair_history = report.get("repair_history", [])
+    if not isinstance(repair_history, list):
+        repair_history = []
+    (output_dir / "openhands-repair-history.json").write_text(
+        json.dumps(repair_history, indent=2), encoding="utf-8"
+    )
+    (output_dir / "openhands-test-results.json").write_text(json.dumps({
+        "result": report.get("harness_result", report.get("result", "failed")),
+        "final_exit_code": report.get("harness_final_exit_code"),
+        "validated_test_command": report.get("validated_test_command"),
+        "environment_ready": report.get("environment_ready", False),
+        "attempts": report.get("harness_attempts", []),
+        "verified_test_results": report.get("verified_test_results", []),
+    }, indent=2), encoding="utf-8")
+
     archive_path = output_dir / "generated-tests.tar.gz"
     archive_valid = False
     if archive_path.exists():
@@ -1062,15 +1358,184 @@ def ensure_failure_artifacts(output_dir: Path, error_name: str) -> tuple[Path, P
     return report_path, archive_path
 
 
-def run_repair_loop(workspace, conversation, test_command: str, max_repairs: int):
-    """Run tests and ask the same agent to repair between failed executions."""
+_INFRASTRUCTURE_FAILURE_RE = re.compile(
+    r"ModuleNotFoundError|No module named|Cannot find module|ERR_MODULE_NOT_FOUND|"
+    r"Could not resolve dependencies|Could not resolve package|No matching distribution|"
+    r"Could not find a version that satisfies|command not found|"
+    r"Connection refused|ECONNREFUSED|ETIMEDOUT|ServiceUnavailable|"
+    r"Could not connect|Failed to download|Failed to resolve plugin",
+    re.I,
+)
+_TEST_FAILURE_EVIDENCE_RE = re.compile(
+    r"(?im)^\s*(?:FAILED\b|FAIL:\s|FAIL\s)|"
+    r"AssertionError|AssertionFailedError|AssertionError|"
+    r"Expected:|Received:|expected .{0,100}(?:got|received|actual)",
+)
+_PYTEST_NODE_RE = re.compile(r"(?im)^\s*(?:FAILED|ERROR)\s+([^\s]+::[^\s]+)")
+_JEST_TEST_RE = re.compile(r"(?m)^\s*●\s*(.+?)\s*$")
+_JUNIT_TEST_RE = re.compile(r"(?im)^\s*([\w.$]+\([^)]*\))\s+<<<\s+FAILURE!")
+_GO_TEST_RE = re.compile(r"(?m)^--- FAIL:\s+([^\s(]+)")
+_MOCHA_TEST_RE = re.compile(r"(?m)^\s*\d+\)\s+(.+?)\s*$")
+_GRADLE_TEST_RE = re.compile(r"(?m)^\s*(.+?)\s+>\s+(.+?)\s+FAILED\s*$")
+
+
+def _failing_test_identifiers(output: str) -> set[str]:
+    identifiers = set(_PYTEST_NODE_RE.findall(output))
+    identifiers.update(_JEST_TEST_RE.findall(output))
+    identifiers.update(_JUNIT_TEST_RE.findall(output))
+    identifiers.update(_GO_TEST_RE.findall(output))
+    identifiers.update(_MOCHA_TEST_RE.findall(output))
+    identifiers.update(f"{suite} > {test}" for suite, test in _GRADLE_TEST_RE.findall(output))
+    return {item.strip() for item in identifiers if item.strip()}
+
+
+def validate_repair_diagnosis(report_text: str, attempt: int, output: str) -> dict:
+    """Validate one agent diagnosis and decide whether app repair is justified."""
+    result = {
+        "attempt": attempt,
+        "reported_category": "unknown",
+        "category": "unknown",
+        "evidence": [],
+        "root_cause": "",
+        "repair_action": "",
+        "validated": False,
+        "repair_allowed": False,
+        "decision_reason": "No valid structured diagnosis was available; human review required.",
+    }
+    try:
+        if len(report_text) > 4 * 1024 * 1024:
+            raise ValueError("diagnosis report exceeds 4 MiB")
+        raw = json.loads(report_text)
+        if not isinstance(raw, dict) or raw.get("schema_version") != 1 or not isinstance(raw.get("failures"), list):
+            raise ValueError("report must be a schema-version-1 object with a failures list")
+        matching = [
+            item for item in raw["failures"]
+            if isinstance(item, dict)
+            and isinstance(item.get("attempt"), int)
+            and not isinstance(item.get("attempt"), bool)
+            and item.get("attempt") == attempt
+        ]
+        if len(matching) != 1:
+            raise ValueError("report must contain exactly one diagnosis for this attempt")
+        item = matching[0]
+        category = item.get("category")
+        failing_test = item.get("failing_test")
+        evidence = item.get("evidence")
+        root_cause_evidence = item.get("root_cause_evidence")
+        root_cause = item.get("root_cause")
+        if not isinstance(category, str) or category not in FAILURE_CATEGORIES:
+            raise ValueError("diagnosis category is invalid")
+        if not isinstance(evidence, list) or not evidence or any(
+            not isinstance(quote, str) or not quote.strip() or quote not in output
+            for quote in evidence
+        ):
+            raise ValueError("diagnosis evidence does not exactly match captured test output")
+        actual_tests = _failing_test_identifiers(output)
+        if not isinstance(failing_test, str) or failing_test not in actual_tests:
+            raise ValueError("diagnosis does not identify a failing test present in captured output")
+        if failing_test not in evidence:
+            raise ValueError("diagnosis evidence must quote the actual failing test identifier")
+        if not isinstance(root_cause_evidence, list) or not root_cause_evidence or any(
+            not isinstance(quote, str) or not quote.strip() or quote not in output or quote not in evidence
+            for quote in root_cause_evidence
+        ):
+            raise ValueError("root-cause evidence must quote captured output and appear in diagnosis evidence")
+        if not isinstance(root_cause, str) or not root_cause.strip():
+            raise ValueError("diagnosis has no root cause")
+        result.update({
+            "reported_category": category,
+            "category": category,
+            "evidence": evidence,
+            "failing_test": failing_test,
+            "root_cause_evidence": root_cause_evidence,
+            "root_cause": root_cause,
+            "repair_action": item.get("repair_action", "") if isinstance(item.get("repair_action"), str) else "",
+            "validated": True,
+            "decision_reason": "Diagnosis has exact output evidence and a root cause.",
+        })
+    except (ValueError, json.JSONDecodeError) as exc:
+        result["decision_reason"] = f"Diagnosis rejected: {exc}; human review required."
+        return result
+
+    if result["category"] not in {"application bug", "regression"}:
+        result["decision_reason"] = (
+            f"Failure classified as {result['category']}; application-code repair was not attempted."
+        )
+        return result
+    if _INFRASTRUCTURE_FAILURE_RE.search(output):
+        result["category"] = "unknown"
+        result["decision_reason"] = (
+            "Captured output contains infrastructure/dependency evidence that conflicts "
+            "with an application-failure classification; human review required."
+        )
+        return result
+    if not _TEST_FAILURE_EVIDENCE_RE.search(output):
+        result["category"] = "unknown"
+        result["decision_reason"] = (
+            "Captured output does not contain a test assertion/failure signature; "
+            "application repair was not attempted; human review required."
+        )
+        return result
+    result["repair_allowed"] = True
+    result["decision_reason"] = "Verified application bug/regression diagnosis; sandbox repair is allowed."
+    return result
+
+
+def _check_generated_tests(test_guard, stage: str) -> dict:
+    if test_guard is None:
+        return {"unchanged": True, "changed_paths": [], "errors": [], "restored": False}
+    try:
+        result = test_guard()
+        if isinstance(result, dict):
+            return result
+        return {"unchanged": bool(result), "changed_paths": [], "errors": [], "restored": False}
+    except Exception as exc:
+        return {
+            "unchanged": False,
+            "changed_paths": [],
+            "errors": [f"Generated-test integrity check failed at {stage}: {type(exc).__name__}: {exc}"],
+            "restored": False,
+        }
+
+
+def run_repair_loop(
+    workspace,
+    conversation,
+    test_command: str,
+    max_repairs: int,
+    generated_tests_guard=None,
+):
+    """Run full-suite attempts; repair only evidence-backed app bugs/regressions."""
     max_repairs = max(0, min(int(max_repairs), 3))
     attempts = []
     final_result = None
+    pending_repair_index = None
     for attempt in range(max_repairs + 1):
+        integrity = _check_generated_tests(generated_tests_guard, "before test run")
+        if not integrity.get("unchanged"):
+            if pending_repair_index is not None:
+                attempts[pending_repair_index]["repair_status"] = "repair_not_verified_test_integrity_failed"
+            attempts.append({
+                "attempt": attempt + 1,
+                "command": test_command,
+                "exit_code": None,
+                "output": "",
+                "test_integrity": integrity,
+                "execution_error": "GeneratedTestIntegrityError",
+                "repair_decision": "human_review",
+                "repair_decision_reason": "Generated-test integrity verification failed before suite execution.",
+            })
+            final_result = SimpleNamespace(
+                exit_code=1,
+                stdout="Repository tests changed; trusted snapshots were restored where possible.",
+                stderr="Suite was not run because test integrity verification failed.",
+            )
+            break
         try:
             result = workspace.execute_command(test_command, timeout=1200)
         except Exception as exc:
+            if pending_repair_index is not None:
+                attempts[pending_repair_index]["repair_status"] = "repair_not_verified_test_execution_failed"
             attempts.append({
                 "attempt": attempt + 1,
                 "command": test_command,
@@ -1090,43 +1555,132 @@ def run_repair_loop(workspace, conversation, test_command: str, max_repairs: int
             "output": output[-12000:],
         })
         final_result = result
-        if result.exit_code == 0 or attempt == max_repairs:
-            if result.exit_code != 0:
-                try:
-                    conversation.send_message(f"""
-The bounded repair limit is reached. Do not modify any files or attempt a
-repair. Update /workspace/openhands-report.json with a diagnosis for attempt
-{attempt + 1}, using a failure category and exact evidence quoted from this
-captured output, plus root_cause and repair_action set to "no repair attempted;
-limit reached". Preserve the actual exit code and output. Do not claim a pass.
-
-Captured output:
-{output[-12000:]}
-""")
-                    conversation.run()
-                except Exception as exc:
-                    attempts[-1]["diagnosis_error"] = type(exc).__name__
+        test_integrity = _check_generated_tests(generated_tests_guard, "after test run")
+        attempts[-1]["test_integrity"] = test_integrity
+        if not test_integrity.get("unchanged"):
+            attempts[-1]["output"] += "\nHarness: test files changed during execution; run result is invalid."
+            attempts[-1]["exit_code"] = 1
+            attempts[-1]["repair_decision"] = "human_review"
+            if pending_repair_index is not None:
+                attempts[pending_repair_index]["repair_status"] = "repair_not_verified_test_integrity_failed"
+                pending_repair_index = None
+            attempts[-1]["repair_decision_reason"] = "Generated tests changed during test execution; the run result was invalidated."
+            final_result = SimpleNamespace(
+                exit_code=1,
+                stdout=output,
+                stderr="Test files changed during execution; trusted snapshots were restored. No repair was attempted.",
+            )
             break
+        if pending_repair_index is not None:
+            attempts[pending_repair_index]["repair_status"] = (
+                "repair_verified" if result.exit_code == 0 else "repair_not_verified"
+            )
+            pending_repair_index = None
+        if result.exit_code == 0:
+            break
+
+        # Diagnosis and repair are separate turns. Unclassified failures never
+        # authorize an application edit.
         try:
             conversation.send_message(f"""
-The test command failed on attempt {attempt + 1} of {max_repairs + 1}.
+The complete test command failed on attempt {attempt + 1} of {max_repairs + 1}.
 
 Actual output follows:
 {output[-12000:]}
 
-Diagnose and classify this failure as dependency, environment, build,
-incorrect test, application bug, regression or unknown. Update
-/workspace/openhands-report.json with a failures entry containing this attempt
-number, category, exact evidence quoted from the output, root_cause and
-repair_action. For failed installs, record dependency_installation_failures
-with package name, manager, command, exit_code and actual output. Make at most
-one minimal sandbox-only repair now. Application fixes must stay in Docker
-and have their changes preserved as diffs for developer approval. Update the
-report with detected versions/toolchains and all actual verification results.
-After repairing, stop; the harness will rerun this same complete-suite test
-command and capture its real exit code. Never claim a pass without that run.
+Diagnose only. Do not modify, create, delete, rename, or chmod any files.
+In /workspace/openhands-report.json, update the structured diagnosis for this
+attempt with category, failing_test (an exact test identifier visible in this
+output), exact evidence that includes that identifier, root_cause, and
+root_cause_evidence (the exact output text supporting that cause), plus
+repair_action. Use unknown if the cause is uncertain or no exact test
+identifier is available. Do not claim the suite
+passed. Do not classify dependency, environment, build or invalid-test
+failures as application bugs.
 """)
             conversation.run()
-        except Exception as exc:  # continue once to record the post-repair test state
+        except Exception as exc:
+            attempts[-1]["diagnosis_error"] = type(exc).__name__
+            attempts[-1]["repair_decision"] = "human_review"
+            attempts[-1]["repair_decision_reason"] = "Agent diagnosis turn failed."
+            break
+
+        diagnosis_integrity = _check_generated_tests(generated_tests_guard, "after diagnosis")
+        attempts[-1]["diagnosis_test_integrity"] = diagnosis_integrity
+        if not diagnosis_integrity.get("unchanged"):
+            attempts[-1]["repair_decision"] = "human_review"
+            attempts[-1]["repair_decision_reason"] = "Test files changed during diagnosis; repair was blocked."
+            break
+
+        try:
+            report_check = workspace.execute_command(
+                "test -f /workspace/openhands-report.json && "
+                "test ! -L /workspace/openhands-report.json",
+                timeout=30,
+            )
+            if report_check.exit_code != 0:
+                raise ValueError("agent report is missing or not a regular file")
+            report_size = workspace.execute_command(
+                "wc -c < /workspace/openhands-report.json", timeout=30
+            )
+            if report_size.exit_code != 0 or not (report_size.stdout or "").strip().isdigit():
+                raise ValueError("could not validate agent report size")
+            if int(report_size.stdout.strip()) > 4 * 1024 * 1024:
+                raise ValueError("agent report exceeds 4 MiB")
+            diagnosis_result = workspace.execute_command(
+                "cat -- /workspace/openhands-report.json", timeout=30
+            )
+            if diagnosis_result.exit_code != 0:
+                raise ValueError(diagnosis_result.stderr or "agent report unavailable")
+            diagnosis = validate_repair_diagnosis(
+                diagnosis_result.stdout or "", attempt + 1, output
+            )
+        except Exception as exc:
+            diagnosis = validate_repair_diagnosis("", attempt + 1, output)
+            diagnosis["decision_reason"] = f"Could not validate diagnosis: {type(exc).__name__}: {exc}; human review required."
+        attempts[-1]["diagnosis"] = diagnosis
+
+        if not diagnosis["repair_allowed"]:
+            attempts[-1]["repair_decision"] = "human_review"
+            attempts[-1]["repair_decision_reason"] = diagnosis["decision_reason"]
+            break
+        if attempt == max_repairs:
+            attempts[-1]["repair_decision"] = "limit_reached"
+            attempts[-1]["repair_decision_reason"] = "Verified application issue, but the repair limit was reached."
+            break
+
+        attempts[-1]["repair_decision"] = "repair_authorized"
+        try:
+            conversation.send_message(f"""
+The harness validated this diagnosis as an application bug/regression using
+exact captured test output:
+{json.dumps(diagnosis, ensure_ascii=False)}
+
+Make at most one minimal correction to application source code inside this
+Docker workspace. Do not modify, delete, rename, chmod, skip, or weaken any
+generated or existing tests. Do not edit workflow or trusted automation files,
+dependency manifests, lockfiles, or test configuration. Never access or print
+credentials. Record the changed application files and proposed patch in
+/workspace/openhands-report.json. Do not claim success; the harness will verify
+generated-test integrity and rerun the complete validated suite.
+""")
+            conversation.run()
+            attempts[-1]["repair_status"] = "repair_attempted_pending_suite_verification"
+        except Exception as exc:
+            attempts[-1]["repair_status"] = "agent_turn_failed"
             attempts[-1]["repair_error"] = type(exc).__name__
+            attempts[-1]["repair_decision"] = "human_review"
+            attempts[-1]["repair_decision_reason"] = (
+                "OpenHands repair turn failed; no repair was verified and the suite was not rerun."
+            )
+
+        repair_integrity = _check_generated_tests(generated_tests_guard, "after repair")
+        attempts[-1]["repair_test_integrity"] = repair_integrity
+        if not repair_integrity.get("unchanged"):
+            attempts[-1]["repair_status"] = "rejected_test_files_modified"
+            attempts[-1]["repair_decision_reason"] = "Test files changed during repair; trusted snapshots were restored and no rerun was allowed."
+            break
+        if attempts[-1]["repair_status"] == "agent_turn_failed":
+            break
+        pending_repair_index = len(attempts) - 1
     return final_result, attempts

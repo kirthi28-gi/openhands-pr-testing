@@ -15,6 +15,10 @@ from openhands.tools.preset.default import get_default_agent
 from openhands.workspace import DockerWorkspace
 from pr_test_harness import (
     ensure_failure_artifacts,
+    capture_generated_tests_snapshot,
+    capture_repository_tests_snapshot,
+    ensure_generated_tests_unchanged,
+    ensure_repository_tests_unchanged,
     files_in_unified_diff,
     final_failure_category,
     load_agent_report,
@@ -383,16 +387,19 @@ YOUR TASK
 8. Follow the repository's existing testing conventions.
 9. Save generated tests in tests/generated/ with repository test-file
    conventions. Preserve existing generated tests and never overwrite them.
+   After generation, never modify, delete, rename, skip, or weaken generated tests.
 10. Use descriptive test names.
 11. Prepare the detected complete-suite command and verify dependencies.
     Do not run the test suite during preparation; the harness runs it and
     supplies authoritative output for diagnosis and repair.
 12. In response to a harness failure only, attempt no more than
     {max(0, min(int(os.getenv("MAX_REPAIR_ATTEMPTS", "2")), 3))} repairs.
-    Resolve dependencies only when identity and installation path are
-    verified. Correct invalid generated tests only when demonstrably wrong.
-    For demonstrated application bugs, make a minimal fix inside Docker and
-    record its unified diff. Never push or publish application fixes.
+    Do not edit application code during preparation or diagnosis. Only the
+    harness may authorize a minimal application-code repair after validating
+    an application bug/regression diagnosis against captured output. If the
+    cause is uncertain or infrastructure-related, stop for human review.
+    Never edit dependencies or tests to make them pass. All fixes stay inside
+    Docker and are retained only as patches for developer review.
 13. After each repair let the harness rerun failed tests and the complete
     relevant regression suite. Report blockers such as unavailable
     credentials, services or dependencies; never invent a passing result.
@@ -401,8 +408,10 @@ YOUR TASK
     `failures`, `dependency_installation_failures`, `root_causes`,
     `modified_files`, `proposed_patches`, `verified_test_results`, and
     `blockers`. Each failure entry must contain `attempt`, one allowed
-    `category`, `evidence` as exact quoted text from that attempt's captured
-    output, `root_cause`, and `repair_action`. Never classify a failure
+    `category`, `failing_test` as an exact identifier visible in that
+    attempt's captured output, `evidence` containing that identifier and
+    exact quoted output, `root_cause`, `root_cause_evidence` as exact output
+    text supporting the cause, and `repair_action`. Never classify a failure
     without matching evidence; use `unknown` when evidence is insufficient.
     Each failed dependency installation must include its package `name`,
     `manager`, exact `command`, nonzero `exit_code`, and actual `output`.
@@ -443,6 +452,16 @@ Do not stop after describing the tests. Create the files.
                 "blockers": [],
                 "limitations": [],
             }
+            generated_tests_snapshot = Path(temp_dir) / "generated-tests-initial.tar.gz"
+            original_generated_tests_snapshot = Path(temp_dir) / "generated-tests-before-agent.tar.gz"
+            generated_tests_manifest = None
+            generated_tests_guard = None
+            generated_tests_snapshot_error = None
+            original_generated_tests_manifest = None
+            generated_tests_initial_integrity = None
+            original_repository_tests_snapshot = Path(temp_dir) / "repository-tests-before-agent.tar.gz"
+            original_repository_tests_manifest = None
+            repository_tests_initial_integrity = None
             agent_error = None
 
             try:
@@ -459,6 +478,25 @@ Do not stop after describing the tests. Create the files.
                     "cp -a /workspace /tmp/openhands-pr-baseline && "
                     "chmod -R a-w /tmp/openhands-pr-baseline",
                 )
+                try:
+                    original_generated_tests_manifest = capture_generated_tests_snapshot(
+                        workspace, original_generated_tests_snapshot
+                    )
+                except Exception as exc:
+                    generated_tests_snapshot_error = (
+                        f"Could not preserve pre-existing generated tests: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    agent_error = agent_error or type(exc).__name__
+                try:
+                    original_repository_tests_manifest = capture_repository_tests_snapshot(
+                        workspace, original_repository_tests_snapshot
+                    )
+                except Exception as exc:
+                    generated_tests_snapshot_error = generated_tests_snapshot_error or (
+                        f"Could not preserve repository tests: {type(exc).__name__}: {exc}"
+                    )
+                    agent_error = agent_error or type(exc).__name__
 
                 # Prepare the environment and generate tests.
                 try:
@@ -466,6 +504,81 @@ Do not stop after describing the tests. Create the files.
                     conversation.run()
                 except Exception as exc:
                     agent_error = type(exc).__name__
+
+                # Existing generated tests are immutable; new tests may be
+                # added only if the pre-existing snapshot still matches.
+                if original_generated_tests_manifest is not None:
+                    generated_tests_initial_integrity = ensure_generated_tests_unchanged(
+                        workspace,
+                        original_generated_tests_snapshot,
+                        original_generated_tests_manifest,
+                        Path(temp_dir) / "generated-tests-current.tar.gz",
+                        allow_additions=True,
+                    )
+                    if not generated_tests_initial_integrity["unchanged"]:
+                        generated_tests_snapshot = original_generated_tests_snapshot
+                        generated_tests_manifest = original_generated_tests_manifest
+                        generated_tests_snapshot.unlink(missing_ok=True)
+                        generated_tests_snapshot_error = (
+                            "The agent modified or deleted pre-existing generated tests; "
+                            "the trusted snapshot was restored and test execution was blocked. "
+                            f"Changed paths: {generated_tests_initial_integrity['changed_paths']}"
+                        )
+                    else:
+                        try:
+                            generated_tests_manifest = capture_generated_tests_snapshot(
+                                workspace, generated_tests_snapshot
+                            )
+                        except Exception as exc:
+                            generated_tests_snapshot.unlink(missing_ok=True)
+                            generated_tests_snapshot_error = (
+                                f"Could not preserve generated tests before execution: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            agent_error = agent_error or type(exc).__name__
+                elif generated_tests_snapshot_error is None:
+                    generated_tests_snapshot_error = "Pre-existing generated-test snapshot is unavailable."
+
+                if original_repository_tests_manifest is not None:
+                    repository_tests_initial_integrity = ensure_repository_tests_unchanged(
+                        workspace,
+                        original_repository_tests_snapshot,
+                        original_repository_tests_manifest,
+                        Path(temp_dir) / "repository-tests-current.tar.gz",
+                    )
+                    if not repository_tests_initial_integrity["unchanged"]:
+                        generated_tests_snapshot_error = (
+                            "The agent modified existing repository tests during preparation or test generation; "
+                            "the trusted snapshot was restored and suite execution was blocked. "
+                            f"Changed paths: {repository_tests_initial_integrity['changed_paths']}"
+                        )
+                elif generated_tests_snapshot_error is None:
+                    generated_tests_snapshot_error = "Repository-test snapshot is unavailable."
+
+                if generated_tests_manifest is not None:
+                    def generated_tests_guard():
+                        generated_result = ensure_generated_tests_unchanged(
+                            workspace,
+                            generated_tests_snapshot,
+                            generated_tests_manifest,
+                            Path(temp_dir) / "generated-tests-current.tar.gz",
+                        )
+                        repository_result = ensure_repository_tests_unchanged(
+                            workspace,
+                            original_repository_tests_snapshot,
+                            original_repository_tests_manifest,
+                            Path(temp_dir) / "repository-tests-current.tar.gz",
+                        )
+                        return {
+                            "unchanged": generated_result["unchanged"] and repository_result["unchanged"],
+                            "changed_paths": generated_result["changed_paths"] + repository_result["changed_paths"],
+                            "errors": generated_result["errors"] + repository_result["errors"],
+                            "restored": generated_result["restored"] or repository_result["restored"],
+                        }
+                else:
+                    message = generated_tests_snapshot_error or "Generated-test integrity snapshot is unavailable."
+                    environment_verification["failures"].append(message)
+                    environment_verification["blockers"].append(message)
 
                 # The agent-created marker is not evidence. Independently
                 # inspect the repository-native command and sandbox state.
@@ -496,6 +609,11 @@ Do not stop after describing the tests. Create the files.
                     environment_verification = verify_test_environment(
                         workspace, repo_path, validated_command
                     )
+                    if generated_tests_manifest is None:
+                        message = generated_tests_snapshot_error or "Generated-test integrity snapshot is unavailable; suite execution was blocked."
+                        environment_verification["failures"].append(message)
+                        environment_verification["blockers"].append(message)
+                        environment_verification["ready"] = False
                     environment_ready = environment_verification["ready"]
                 except Exception as exc:
                     agent_error = agent_error or type(exc).__name__
@@ -507,7 +625,11 @@ Do not stop after describing the tests. Create the files.
                     try:
                         test_command = sandbox_test_command(validated_command)
                         test_result, attempt_records = run_repair_loop(
-                            workspace, conversation, test_command, max_repair_attempts
+                            workspace,
+                            conversation,
+                            test_command,
+                            max_repair_attempts,
+                            generated_tests_guard=generated_tests_guard,
                         )
                     except Exception as exc:
                         agent_error = type(exc).__name__
@@ -613,6 +735,35 @@ Do not stop after describing the tests. Create the files.
 
             report_path = output_dir / "openhands-report.json"
             report = load_agent_report(report_path, attempt_records)
+            diagnosis_gate_by_attempt = {
+                item.get("attempt"): item
+                for item in attempt_records
+                if item.get("repair_decision") == "human_review" or item.get("diagnosis")
+            }
+            for failure in report["failures"]:
+                gate = diagnosis_gate_by_attempt.get(failure.get("attempt"))
+                diagnosis = gate.get("diagnosis") if isinstance(gate, dict) else None
+                if isinstance(diagnosis, dict) and diagnosis.get("validated"):
+                    for key in ("category", "evidence", "root_cause", "failing_test", "root_cause_evidence"):
+                        if key in diagnosis:
+                            failure[key] = diagnosis[key]
+                elif gate:
+                    failure["reported_category"] = failure.get("category")
+                    failure["category"] = "unknown"
+            unclassified_attempts = {
+                attempt for attempt, gate in diagnosis_gate_by_attempt.items()
+                if not isinstance(gate.get("diagnosis"), dict)
+                or not gate["diagnosis"].get("validated")
+                or gate["diagnosis"].get("category") == "unknown"
+            }
+            if unclassified_attempts:
+                report["root_causes"] = [
+                    cause for cause in report["root_causes"]
+                    if not (
+                        isinstance(cause, dict)
+                        and cause.get("attempt") in unclassified_attempts
+                    )
+                ]
             report_valid = not report["report_validation_errors"]
             validation_marker.unlink(missing_ok=True)
             patch_path = output_dir / "openhands-application.patch"
@@ -652,6 +803,26 @@ Do not stop after describing the tests. Create the files.
                     item for item in attempt_records
                     if isinstance(item.get("exit_code"), int)
                 ],
+                "repair_history": [
+                    {
+                        "attempt": item.get("attempt"),
+                        "diagnosis": item.get("diagnosis"),
+                        "decision": item.get("repair_decision"),
+                        "decision_reason": item.get("repair_decision_reason"),
+                        "repair_status": item.get("repair_status"),
+                        "test_integrity": item.get("repair_test_integrity")
+                        or item.get("diagnosis_test_integrity")
+                        or item.get("test_integrity"),
+                        "repair_error": item.get("repair_error"),
+                    }
+                    for item in attempt_records
+                    if any(key in item for key in (
+                        "diagnosis", "repair_decision", "repair_status", "repair_error",
+                        "test_integrity", "diagnosis_test_integrity", "repair_test_integrity",
+                    ))
+                ],
+                "generated_tests_initial_integrity": generated_tests_initial_integrity,
+                "repository_tests_initial_integrity": repository_tests_initial_integrity,
                 "modified_files": sorted(set(report["modified_files"]) |
                                           set(files_in_unified_diff(patch_text))),
                 "application_patch_artifact": "openhands-application.patch",
@@ -668,23 +839,33 @@ Do not stop after describing the tests. Create the files.
                 report["report_validation_errors"].append(
                     "Sandbox application diff could not be captured as a valid patch."
                 )
+            repair_history_path = output_dir / "openhands-repair-history.json"
+            repair_history_path.write_text(
+                json.dumps(report["repair_history"], indent=2), encoding="utf-8"
+            )
+            test_results_path = output_dir / "openhands-test-results.json"
+            test_results_path.write_text(json.dumps({
+                "result": report["result"],
+                "final_exit_code": test_result.exit_code,
+                "validated_test_command": validated_command,
+                "environment_ready": environment_ready,
+                "attempts": attempt_records,
+                "final_stdout": test_result.stdout or "",
+                "final_stderr": test_result.stderr or "",
+            }, indent=2), encoding="utf-8")
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
             report_valid = update_validation_marker(validation_marker, report)
 
             # Save the diagnosis before packaging test files so a packaging
             # error cannot erase the machine-readable failure report.
-            run_checked(
-                workspace,
-                "mkdir -p /workspace/tests/generated && "
-                "tar -czf /workspace/generated-tests.tar.gz "
-                "-C /workspace tests/generated",
-            )
-            download = workspace.file_download(
-                source_path="/workspace/generated-tests.tar.gz",
-                destination_path=str(output_dir / "generated-tests.tar.gz"),
-            )
-            if not download.success:
-                raise RuntimeError("Could not download generated tests.")
+            generated_archive_path = output_dir / "generated-tests.tar.gz"
+            if generated_tests_snapshot.is_file():
+                shutil.copy2(generated_tests_snapshot, generated_archive_path)
+            else:
+                with tarfile.open(generated_archive_path, "w:gz") as archive:
+                    directory = tarfile.TarInfo("tests/generated/")
+                    directory.type = tarfile.DIRTYPE
+                    archive.addfile(directory)
 
             # Extract generated test files on the GitHub runner.
             downloaded_archive = output_dir / "generated-tests.tar.gz"
@@ -740,8 +921,6 @@ Do not stop after describing the tests. Create the files.
                     members=members,
                     filter="data",
                 )
-
-            downloaded_archive.unlink(missing_ok=True)
 
             report["agent_reported_modified_files"] = report["modified_files"]
             report["modified_files"] = sorted(
