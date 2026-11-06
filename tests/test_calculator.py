@@ -33,3 +33,19 @@ def test_invalid_identifier_raises():
     ev = SafeEvaluator()
     with pytest.raises(ValueError):
         ev.evaluate("unknown_name")
+
+
+def test_factorial():
+    ev = SafeEvaluator()
+    assert ev.evaluate("factorial(5)") == 120
+    assert ev.evaluate("factorial(0)") == 1
+
+
+def test_factorial_rejects_invalid_inputs():
+    ev = SafeEvaluator()
+
+    with pytest.raises(ValueError):
+        ev.evaluate("factorial(-1)")
+
+    with pytest.raises(ValueError):
+        ev.evaluate("factorial(2.5)")

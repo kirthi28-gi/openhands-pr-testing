@@ -37,11 +37,18 @@ class SafeEvaluator:
             "tan": lambda x: math.tan(math.radians(x)),
             "sqrt": math.sqrt,
             "log": math.log,
+            "factorial": self._factorial,
         }
         self.consts = {
             "pi": math.pi,
             "e": math.e,
         }
+
+    @staticmethod
+    def _factorial(value):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("Factorial requires a non-negative integer")
+        return math.factorial(value)
 
     def evaluate(self, expr: str):
         expr = expr.replace("^", "**")
