@@ -1,0 +1,103 @@
+
+name: OpenHands Test Generation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [baseline]
+
+concurrency:
+  group: openhands-test-generation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  generate-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare PR diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff "$BASE_SHA" "$HEAD_SHA" > pr.diff
+          echo "PR diff generated."
+          wc -l pr.diff
+
+      - name: Install OpenHands SDK
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            openhands-sdk \
+            openhands-tools \
+            openhands-workspace \
+            openhands-agent-server
+
+          python -m pip show openhands-sdk openhands-tools openhands-workspace openhands-agent-server
+
+      - name: Inspect OpenHands conversation API
+        run: |
+          python - <<'PYCODE'
+          import inspect
+          from importlib.metadata import version
+          from openhands.sdk import Conversation
+
+          packages = [
+              "openhands-sdk",
+              "openhands-tools",
+              "openhands-workspace",
+              "openhands-agent-server",
+          ]
+
+          for package in packages:
+              print(f"{package}: {version(package)}")
+
+          print("\\nConversation API:")
+          for method_name in ["send_message", "run", "close"]:
+              method = getattr(Conversation, method_name, None)
+              if method is None:
+                  print(f"{method_name}: NOT FOUND")
+              else:
+                  print(f"{method_name}: {inspect.signature(method)}")
+          PYCODE
+
+      - name: Generate and execute tests in OpenHands sandbox
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: gpt-6-luna
+          LLM_BASE_URL: https://api.openai.com/v1
+
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+          PR_DIFF_FILE: ${{ github.workspace }}/pr.diff
+
+        run: python .github/scripts/generate_tests.py
+
+      - name: Upload generated tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openhands-generated-tests
+          path: generated-tests/
+          if-no-files-found: warn
+          retention-days: 30
