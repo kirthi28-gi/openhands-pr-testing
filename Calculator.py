@@ -38,6 +38,7 @@ class SafeEvaluator:
             "sqrt": math.sqrt,
             "log": math.log,
             "factorial": self._factorial,
+            "square": lambda value: value * 3,
         }
         self.consts = {
             "pi": math.pi,
