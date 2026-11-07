@@ -1498,6 +1498,30 @@ def _check_generated_tests(test_guard, stage: str) -> dict:
         }
 
 
+def _read_repair_diagnosis(workspace, attempt: int, output: str) -> dict:
+    """Read and strictly validate the current agent report for one attempt."""
+    report_check = workspace.execute_command(
+        "test -f /workspace/openhands-report.json && "
+        "test ! -L /workspace/openhands-report.json",
+        timeout=30,
+    )
+    if report_check.exit_code != 0:
+        raise ValueError("agent report is missing or not a regular file")
+    report_size = workspace.execute_command(
+        "wc -c < /workspace/openhands-report.json", timeout=30
+    )
+    if report_size.exit_code != 0 or not (report_size.stdout or "").strip().isdigit():
+        raise ValueError("could not validate agent report size")
+    if int(report_size.stdout.strip()) > 4 * 1024 * 1024:
+        raise ValueError("agent report exceeds 4 MiB")
+    diagnosis_result = workspace.execute_command(
+        "cat -- /workspace/openhands-report.json", timeout=30
+    )
+    if diagnosis_result.exit_code != 0:
+        raise ValueError(diagnosis_result.stderr or "agent report unavailable")
+    return validate_repair_diagnosis(diagnosis_result.stdout or "", attempt, output)
+
+
 def run_repair_loop(
     workspace,
     conversation,
@@ -1613,31 +1637,54 @@ failures as application bugs.
             break
 
         try:
-            report_check = workspace.execute_command(
-                "test -f /workspace/openhands-report.json && "
-                "test ! -L /workspace/openhands-report.json",
-                timeout=30,
-            )
-            if report_check.exit_code != 0:
-                raise ValueError("agent report is missing or not a regular file")
-            report_size = workspace.execute_command(
-                "wc -c < /workspace/openhands-report.json", timeout=30
-            )
-            if report_size.exit_code != 0 or not (report_size.stdout or "").strip().isdigit():
-                raise ValueError("could not validate agent report size")
-            if int(report_size.stdout.strip()) > 4 * 1024 * 1024:
-                raise ValueError("agent report exceeds 4 MiB")
-            diagnosis_result = workspace.execute_command(
-                "cat -- /workspace/openhands-report.json", timeout=30
-            )
-            if diagnosis_result.exit_code != 0:
-                raise ValueError(diagnosis_result.stderr or "agent report unavailable")
-            diagnosis = validate_repair_diagnosis(
-                diagnosis_result.stdout or "", attempt + 1, output
-            )
+            diagnosis = _read_repair_diagnosis(workspace, attempt + 1, output)
         except Exception as exc:
             diagnosis = validate_repair_diagnosis("", attempt + 1, output)
             diagnosis["decision_reason"] = f"Could not validate diagnosis: {type(exc).__name__}: {exc}; human review required."
+
+        # A malformed or incomplete structured report should not end the
+        # repair flow immediately. Give OpenHands one report-only correction
+        # turn, then apply the same strict validation gates again.
+        if not diagnosis["validated"]:
+            attempts[-1]["diagnosis_validation_error"] = diagnosis["decision_reason"]
+            try:
+                conversation.send_message(f"""
+The harness rejected the diagnosis report for attempt {attempt + 1}:
+{diagnosis['decision_reason']}
+
+Replace the complete `failures` entry for attempt {attempt + 1} in
+/workspace/openhands-report.json with a complete entry containing every
+required schema field: `attempt`, `category`, `failing_test` (an exact test
+identifier present below), `evidence` containing that identifier and exact
+output text, `root_cause`, `root_cause_evidence` (exact output text also
+included in `evidence`), and `repair_action`. Preserve every other entry in
+`failures` and all other report fields and metadata. Do not modify, create,
+delete, rename, or chmod any other file. Use `unknown` if the evidence does
+not support an application bug or regression. Do not attempt an application
+repair in this turn.
+
+Captured test output:
+{output[-12000:]}
+""")
+                conversation.run()
+                retry_integrity = _check_generated_tests(
+                    generated_tests_guard, "after diagnosis correction"
+                )
+                attempts[-1]["diagnosis_correction_test_integrity"] = retry_integrity
+                if not retry_integrity.get("unchanged"):
+                    attempts[-1]["diagnosis_recovery_error"] = (
+                        "Test files changed during diagnosis correction; repair was blocked."
+                    )
+                    diagnosis = validate_repair_diagnosis("", attempt + 1, output)
+                else:
+                    diagnosis = _read_repair_diagnosis(workspace, attempt + 1, output)
+                    attempts[-1]["diagnosis_correction"] = "validated" if diagnosis["validated"] else "rejected"
+            except Exception as exc:
+                attempts[-1]["diagnosis_recovery_error"] = f"{type(exc).__name__}: {exc}"
+                diagnosis = validate_repair_diagnosis("", attempt + 1, output)
+                diagnosis["decision_reason"] = (
+                    f"Diagnosis correction failed: {type(exc).__name__}: {exc}; human review required."
+                )
         attempts[-1]["diagnosis"] = diagnosis
 
         if not diagnosis["repair_allowed"]:
