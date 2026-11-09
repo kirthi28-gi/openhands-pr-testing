@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 import hashlib
+import os
 import re
 import shlex
+import sys
 import tarfile
+import time
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
+try:
+    from packaging.requirements import Requirement as PackagingRequirement, InvalidRequirement
+except ImportError:
+    PackagingRequirement = None
+    InvalidRequirement = Exception
 
 
 FAILURE_CATEGORIES = {
@@ -21,6 +36,15 @@ FAILURE_CATEGORIES = {
     "unknown",
 }
 
+SUPPORTED_PACKAGE_MANAGERS = {"pip", "poetry", "uv", "pipenv"}
+UNSUPPORTED_PACKAGE_MANAGERS = {"conda", "pdm", "pixi", "flit", "hatch"}
+
+SANDBOX_ENV_ALLOWLIST = {
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "PWD",
+    "PYTHONPATH", "VIRTUAL_ENV", "CI", "DEBIAN_FRONTEND",
+    "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE",
+}
+
 _SHELL_OPERATOR_CHARS = ";&|<>\n\r\x00"
 _SHELL_EXPANSION_CHARS = "*?[]{}~"
 _FORBIDDEN_COMMANDS = {
@@ -31,6 +55,225 @@ _JS_TEST_RUNNERS = {
     "jest", "vitest", "mocha", "ava", "tap", "node:test",
     "react-scripts", "vue-cli-service", "ng",
 }
+
+
+def detect_python_manifests(
+    repository_root: Path,
+    runtime_version: str | None = None,
+) -> dict:
+    """Detect Python version declarations, manifests, lockfiles, and package manager.
+
+    Does not guess or assume default Python 3.12 when undeclared; records the
+    runtime assumption explicitly. Reports unsupported package managers
+    clearly without guessing installation commands.
+    """
+    current_runtime = (
+        runtime_version
+        if runtime_version is not None
+        else f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
+
+    manifest_files: list[str] = []
+    lockfiles: list[str] = []
+    declared_python: str | None = None
+
+    # Dotfiles version detection
+    pyver = repository_root / ".python-version"
+    if pyver.is_file():
+        manifest_files.append(".python-version")
+        try:
+            declared_python = pyver.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+        except Exception:
+            pass
+
+    toolver = repository_root / ".tool-versions"
+    if toolver.is_file():
+        manifest_files.append(".tool-versions")
+        if declared_python is None:
+            try:
+                for line in toolver.read_text(encoding="utf-8").splitlines():
+                    if line.strip().startswith("python "):
+                        declared_python = line.strip().split(maxsplit=1)[1].strip()
+                        break
+            except Exception:
+                pass
+
+    # pyproject.toml
+    pyproject_file = repository_root / "pyproject.toml"
+    pyproject_data: dict = {}
+    if pyproject_file.is_file():
+        manifest_files.append("pyproject.toml")
+        if tomllib is not None:
+            try:
+                pyproject_data = tomllib.loads(pyproject_file.read_text(encoding="utf-8"))
+                if declared_python is None:
+                    proj = pyproject_data.get("project", {})
+                    if isinstance(proj, dict) and "requires-python" in proj:
+                        declared_python = str(proj["requires-python"]).strip()
+                    poetry = pyproject_data.get("tool", {}).get("poetry", {})
+                    if declared_python is None and isinstance(poetry, dict):
+                        p_deps = poetry.get("dependencies", {})
+                        if isinstance(p_deps, dict) and "python" in p_deps:
+                            declared_python = str(p_deps["python"]).strip()
+            except Exception:
+                pass
+
+    # Pipfile & Pipfile.lock
+    pipfile = repository_root / "Pipfile"
+    if pipfile.is_file():
+        manifest_files.append("Pipfile")
+        if declared_python is None and tomllib is not None:
+            try:
+                p_data = tomllib.loads(pipfile.read_text(encoding="utf-8"))
+                req = p_data.get("requires", {})
+                if isinstance(req, dict):
+                    declared_python = req.get("python_version") or req.get("python_full_version")
+            except Exception:
+                pass
+
+    pipfile_lock = repository_root / "Pipfile.lock"
+    if pipfile_lock.is_file():
+        lockfiles.append("Pipfile.lock")
+        if declared_python is None:
+            try:
+                lock_data = json.loads(pipfile_lock.read_text(encoding="utf-8"))
+                req = lock_data.get("_meta", {}).get("requires", {})
+                declared_python = req.get("python_version") or req.get("python_full_version")
+            except Exception:
+                pass
+
+    # poetry.lock
+    if (repository_root / "poetry.lock").is_file():
+        lockfiles.append("poetry.lock")
+
+    # uv.lock
+    if (repository_root / "uv.lock").is_file():
+        lockfiles.append("uv.lock")
+
+    # setup.cfg
+    setup_cfg = repository_root / "setup.cfg"
+    if setup_cfg.is_file():
+        manifest_files.append("setup.cfg")
+        if declared_python is None:
+            try:
+                cfg = configparser.ConfigParser()
+                cfg.read_string(setup_cfg.read_text(encoding="utf-8"))
+                if cfg.has_option("options", "python_requires"):
+                    declared_python = cfg.get("options", "python_requires").strip()
+            except Exception:
+                pass
+
+    # setup.py
+    if (repository_root / "setup.py").is_file():
+        manifest_files.append("setup.py")
+
+    # requirements*.txt
+    for req in sorted(repository_root.glob("requirements*.txt")):
+        if req.is_file():
+            manifest_files.append(req.name)
+
+    # constraints.txt
+    if (repository_root / "constraints.txt").is_file():
+        lockfiles.append("constraints.txt")
+
+    # Version assumption
+    python_version_constraint = None
+    is_exact_python_version = (
+        declared_python is not None
+        and re.fullmatch(r"\d+\.\d+(?:\.\d+)?", declared_python) is not None
+    )
+
+    if is_exact_python_version:
+        python_version_assumption = None
+        effective_python = declared_python
+    elif declared_python is not None:
+        python_version_constraint = declared_python
+        effective_python = current_runtime
+        python_version_assumption = (
+            f"Project declares Python constraint {declared_python}; "
+            f"using available runtime {current_runtime}. Compatibility must be verified."
+        )
+    else:
+        python_version_assumption = (
+            f"Project does not declare a Python version constraint; using available runtime {current_runtime}"
+        )
+        effective_python = current_runtime
+
+    # Package manager detection
+    tools = pyproject_data.get("tool", {}) if isinstance(pyproject_data.get("tool"), dict) else {}
+    backend = str(pyproject_data.get("build-system", {}).get("build-backend", ""))
+
+    package_manager: str | None = None
+    if any((repository_root / name).is_file() for name in ("environment.yml", "environment.yaml", "conda.yaml")):
+        package_manager = "conda"
+    elif (repository_root / "pdm.lock").is_file() or "pdm" in tools:
+        package_manager = "pdm"
+    elif any((repository_root / name).is_file() for name in ("pixi.toml", "pixi.lock")) or "pixi" in tools:
+        package_manager = "pixi"
+    elif (repository_root / "flit.ini").is_file() or "flit" in tools or "flit_core" in backend:
+        package_manager = "flit"
+    elif (repository_root / "hatch.toml").is_file() or "hatch" in tools or "hatchling" in backend:
+        package_manager = "hatch"
+
+    if package_manager is None:
+        if (repository_root / "poetry.lock").is_file() or "poetry" in tools:
+            package_manager = "poetry"
+        elif (repository_root / "Pipfile").is_file() or (repository_root / "Pipfile.lock").is_file():
+            package_manager = "pipenv"
+        elif (repository_root / "uv.lock").is_file() or "uv" in tools:
+            package_manager = "uv"
+        elif any(f.startswith("requirements") for f in manifest_files) or "setup.py" in manifest_files or "setup.cfg" in manifest_files or (pyproject_file.is_file() and "project" in pyproject_data):
+            package_manager = "pip"
+
+    if package_manager in UNSUPPORTED_PACKAGE_MANAGERS:
+        is_supported = False
+        unsupported_reason = (
+            f"Detected '{package_manager}' package manager, which is not supported. "
+            f"Supported managers are: {', '.join(sorted(SUPPORTED_PACKAGE_MANAGERS))}."
+        )
+    elif package_manager in SUPPORTED_PACKAGE_MANAGERS:
+        is_supported = True
+        unsupported_reason = None
+    else:
+        is_supported = False
+        unsupported_reason = "No recognized Python package manager manifest found."
+
+    # Lockfile policy
+    if package_manager == "poetry":
+        has_lock = (repository_root / "poetry.lock").is_file()
+        lockfile_present = has_lock
+        lockfile_policy = "enforce_pinned" if has_lock else "missing_lockfile_requires_policy"
+    elif package_manager == "pipenv":
+        has_lock = (repository_root / "Pipfile.lock").is_file()
+        lockfile_present = has_lock
+        lockfile_policy = "enforce_pinned" if has_lock else "missing_lockfile_requires_policy"
+    elif package_manager == "uv":
+        has_lock = (repository_root / "uv.lock").is_file()
+        lockfile_present = has_lock
+        lockfile_policy = "enforce_pinned" if has_lock else "missing_lockfile_requires_policy"
+    elif package_manager == "pip":
+        has_lock = any((repository_root / name).is_file() for name in ("constraints.txt", "requirements-lock.txt"))
+        lockfile_present = True if has_lock else None
+        lockfile_policy = "preserve_manifest_pins"
+    else:
+        lockfile_present = False
+        lockfile_policy = "unsupported_manager"
+
+    return {
+        "package_manager": package_manager,
+        "is_supported": is_supported,
+        "unsupported_reason": unsupported_reason,
+        "declared_python_version": declared_python,
+        "python_version_constraint": python_version_constraint,
+        "runtime_python_version": current_runtime,
+        "python_version_assumption": python_version_assumption,
+        "effective_python_version": effective_python,
+        "manifest_files": sorted(list(set(manifest_files))),
+        "lockfiles": sorted(list(set(lockfiles))),
+        "lockfile_present": lockfile_present,
+        "lockfile_policy": lockfile_policy,
+    }
+
 
 
 def _lex_one_command(command: str) -> list[str]:
@@ -392,11 +635,15 @@ def _run_verification_check(workspace, checks: list[dict], name: str, argv: list
         result = workspace.execute_command(sandbox_test_command(command), timeout=600)
         stdout = result.stdout or ""
         stderr = result.stderr or ""
-        output = (stdout + ("\n" if stdout and stderr else "") + stderr)[-12000:]
+        output = _redact_sensitive_values(
+            (stdout + ("\n" if stdout and stderr else "") + stderr)[-12000:]
+        )
         code = result.exit_code
     except Exception as exc:
         code = None
-        output = f"Verification command raised {type(exc).__name__}: {exc}"
+        output = _redact_sensitive_values(
+            f"Verification command raised {type(exc).__name__}: {exc}"
+        )
     passed = code == 0
     checks.append({
         "name": name,
@@ -634,13 +881,115 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
     }
 
 
+def run_environment_recovery(
+    workspace,
+    conversation,
+    verification: dict,
+    verify_again,
+    max_attempts: int = 2,
+    integrity_guard=None,
+    sleep_fn=time.sleep,
+) -> tuple[dict, list[dict]]:
+    """Allow bounded, evidence-led repairs for environment preparation errors.
+
+    ``verify_again`` must independently validate runtimes, dependencies and
+    test discovery. Repairs never authorize editing test files, and integrity
+    is checked both before and after each agent turn.
+    """
+    attempts: list[dict] = []
+    limit = max(0, min(int(max_attempts), 2))
+    terminal_markers = re.compile(
+        r"(?:credential|authentication|unauthorized|permission denied|"
+        r"docker (?:is not available|daemon)|connection refused|service unavailable)",
+        re.I,
+    )
+    for attempt in range(1, limit + 1):
+        failures = verification.get("failures", [])
+        blockers = verification.get("blockers", [])
+        evidence = _redact_sensitive_values(
+            "\n".join(str(item) for item in [*failures, *blockers])
+        )
+        if terminal_markers.search(evidence):
+            attempts.append({"attempt": attempt, "result": "blocked", "reason": evidence})
+            break
+        if integrity_guard is not None:
+            before = integrity_guard()
+            if not before.get("unchanged"):
+                attempts.append({"attempt": attempt, "result": "blocked", "reason": "test integrity guard failed before recovery", "integrity": before})
+                break
+        prompt = f"""
+Environment preparation failed independent verification. Diagnose the captured
+runtime, dependency, module-resolution, build/configuration, and collection
+output; apply a minimal evidence-backed fix inside this disposable sandbox.
+You may install a dependency only after identifying it from repository
+manifests/lockfiles and observed errors, using that repository's package
+manager (pip/uv for Python; npm/pnpm/yarn for JavaScript; Maven/Gradle for
+Java). Preserve pinned versions and lockfiles, use the declared manager, and
+do not guess package names or versions. Do not modify, delete, skip,
+rename, chmod, or weaken any existing or generated test. Do not change the
+harness, workflow, security controls, or protected files. Do not retry for
+missing credentials, external service outages, Docker/permission boundaries,
+or ambiguous packages. Do not claim readiness; independent verification follows.
+
+Verification failures:
+{evidence[-24000:]}
+"""
+        try:
+            conversation.send_message(prompt)
+            conversation.run()
+            integrity = integrity_guard() if integrity_guard is not None else {"unchanged": True}
+            if not integrity.get("unchanged"):
+                attempts.append({"attempt": attempt, "result": "blocked", "reason": "test integrity guard failed after recovery", "integrity": integrity})
+                break
+            verification = verify_again()
+            attempts.append({
+                "attempt": attempt,
+                "result": "ready" if verification.get("ready") else "still_blocked",
+                "failures": verification.get("failures", []),
+                "integrity": integrity,
+            })
+            if verification.get("ready"):
+                break
+            if attempt < limit:
+                sleep_fn(min(0.5 * (2 ** (attempt - 1)), 2.0))
+        except Exception as exc:
+            attempts.append({
+                "attempt": attempt,
+                "result": "error",
+                "error": _redact_sensitive_values(f"{type(exc).__name__}: {exc}"),
+            })
+            break
+    verification["recovery_attempts"] = attempts
+    return verification, attempts
+
+
+def _redact_sensitive_values(text: str) -> str:
+    """Remove secret-bearing environment values before prompts/artifacts."""
+    for name, value in os.environ.items():
+        if re.search(r"(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH)", name, re.I) and value:
+            text = text.replace(value, "[REDACTED]")
+    return text
+
+
 def sandbox_test_command(command: str) -> str:
-    """Build a shell-safe invocation while removing inherited credentials."""
+    """Run tests with only explicitly approved, non-secret environment variables."""
     argv = shlex.split(command)
-    return "cd /workspace && " + shlex.join([
-        "env", "-u", "SESSION_API_KEY", "-u", "OH_SESSION_API_KEYS_0",
-        "-u", "LLM_API_KEY", *argv,
-    ])
+
+    defaults = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/tmp",
+        "LANG": "C.UTF-8",
+        "SHELL": "/bin/sh",
+    }
+    environment_args = ["env", "-i"]
+
+    for name in sorted(SANDBOX_ENV_ALLOWLIST):
+        default = defaults.get(name, "")
+        environment_args.append(
+            f'{name}="${{{name}:-{default}}}"'
+        )
+
+    return "cd /workspace && " + " ".join(environment_args) + " -- " + shlex.join(argv)
 
 
 def generated_tests_manifest_from_archive(archive_path: Path) -> dict:
@@ -1498,6 +1847,30 @@ def _check_generated_tests(test_guard, stage: str) -> dict:
         }
 
 
+def _read_repair_diagnosis(workspace, attempt: int, output: str) -> dict:
+    """Read and strictly validate the current agent report for one attempt."""
+    report_check = workspace.execute_command(
+        "test -f /workspace/openhands-report.json && "
+        "test ! -L /workspace/openhands-report.json",
+        timeout=30,
+    )
+    if report_check.exit_code != 0:
+        raise ValueError("agent report is missing or not a regular file")
+    report_size = workspace.execute_command(
+        "wc -c < /workspace/openhands-report.json", timeout=30
+    )
+    if report_size.exit_code != 0 or not (report_size.stdout or "").strip().isdigit():
+        raise ValueError("could not validate agent report size")
+    if int(report_size.stdout.strip()) > 4 * 1024 * 1024:
+        raise ValueError("agent report exceeds 4 MiB")
+    diagnosis_result = workspace.execute_command(
+        "cat -- /workspace/openhands-report.json", timeout=30
+    )
+    if diagnosis_result.exit_code != 0:
+        raise ValueError(diagnosis_result.stderr or "agent report unavailable")
+    return validate_repair_diagnosis(diagnosis_result.stdout or "", attempt, output)
+
+
 def run_repair_loop(
     workspace,
     conversation,
@@ -1613,31 +1986,54 @@ failures as application bugs.
             break
 
         try:
-            report_check = workspace.execute_command(
-                "test -f /workspace/openhands-report.json && "
-                "test ! -L /workspace/openhands-report.json",
-                timeout=30,
-            )
-            if report_check.exit_code != 0:
-                raise ValueError("agent report is missing or not a regular file")
-            report_size = workspace.execute_command(
-                "wc -c < /workspace/openhands-report.json", timeout=30
-            )
-            if report_size.exit_code != 0 or not (report_size.stdout or "").strip().isdigit():
-                raise ValueError("could not validate agent report size")
-            if int(report_size.stdout.strip()) > 4 * 1024 * 1024:
-                raise ValueError("agent report exceeds 4 MiB")
-            diagnosis_result = workspace.execute_command(
-                "cat -- /workspace/openhands-report.json", timeout=30
-            )
-            if diagnosis_result.exit_code != 0:
-                raise ValueError(diagnosis_result.stderr or "agent report unavailable")
-            diagnosis = validate_repair_diagnosis(
-                diagnosis_result.stdout or "", attempt + 1, output
-            )
+            diagnosis = _read_repair_diagnosis(workspace, attempt + 1, output)
         except Exception as exc:
             diagnosis = validate_repair_diagnosis("", attempt + 1, output)
             diagnosis["decision_reason"] = f"Could not validate diagnosis: {type(exc).__name__}: {exc}; human review required."
+
+        # A malformed or incomplete structured report should not end the
+        # repair flow immediately. Give OpenHands one report-only correction
+        # turn, then apply the same strict validation gates again.
+        if not diagnosis["validated"]:
+            attempts[-1]["diagnosis_validation_error"] = diagnosis["decision_reason"]
+            try:
+                conversation.send_message(f"""
+The harness rejected the diagnosis report for attempt {attempt + 1}:
+{diagnosis['decision_reason']}
+
+Replace the complete `failures` entry for attempt {attempt + 1} in
+/workspace/openhands-report.json with a complete entry containing every
+required schema field: `attempt`, `category`, `failing_test` (an exact test
+identifier present below), `evidence` containing that identifier and exact
+output text, `root_cause`, `root_cause_evidence` (exact output text also
+included in `evidence`), and `repair_action`. Preserve every other entry in
+`failures` and all other report fields and metadata. Do not modify, create,
+delete, rename, or chmod any other file. Use `unknown` if the evidence does
+not support an application bug or regression. Do not attempt an application
+repair in this turn.
+
+Captured test output:
+{output[-12000:]}
+""")
+                conversation.run()
+                retry_integrity = _check_generated_tests(
+                    generated_tests_guard, "after diagnosis correction"
+                )
+                attempts[-1]["diagnosis_correction_test_integrity"] = retry_integrity
+                if not retry_integrity.get("unchanged"):
+                    attempts[-1]["diagnosis_recovery_error"] = (
+                        "Test files changed during diagnosis correction; repair was blocked."
+                    )
+                    diagnosis = validate_repair_diagnosis("", attempt + 1, output)
+                else:
+                    diagnosis = _read_repair_diagnosis(workspace, attempt + 1, output)
+                    attempts[-1]["diagnosis_correction"] = "validated" if diagnosis["validated"] else "rejected"
+            except Exception as exc:
+                attempts[-1]["diagnosis_recovery_error"] = f"{type(exc).__name__}: {exc}"
+                diagnosis = validate_repair_diagnosis("", attempt + 1, output)
+                diagnosis["decision_reason"] = (
+                    f"Diagnosis correction failed: {type(exc).__name__}: {exc}; human review required."
+                )
         attempts[-1]["diagnosis"] = diagnosis
 
         if not diagnosis["repair_allowed"]:
