@@ -639,3 +639,29 @@ def test_failure_artifacts_include_test_results_and_repair_history(tmp_path):
     assert results["attempts"] == [{"attempt": 1, "exit_code": 1}]
     assert history == [{"attempt": 1, "decision": "human_review"}]
     assert (tmp_path / "openhands-application.patch").is_file()
+
+
+def test_sandbox_test_command_starts_with_clean_environment():
+    from pr_test_harness import sandbox_test_command
+
+    command = sandbox_test_command("pytest -q")
+
+    assert "env -i" in command
+    assert command.startswith("cd /workspace && env -i")
+    assert "pytest -q" in command
+
+
+def test_sandbox_test_command_does_not_forward_api_credentials():
+    from pr_test_harness import sandbox_test_command
+
+    command = sandbox_test_command("pytest")
+
+    forbidden = [
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "SESSION_API_KEY",
+        "LLM_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+    ]
+    for secret in forbidden:
+        assert secret not in command
