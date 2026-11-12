@@ -175,6 +175,121 @@ def test_repair_loop_repairs_only_after_valid_diagnosis_then_reruns_full_suite()
     assert attempts[0]["repair_decision"] == "repair_authorized"
 
 
+def test_incomplete_diagnosis_gets_one_correction_turn_then_repairs():
+    output = (
+        "FAILED tests/generated/test_square.py::test_square_positive\n"
+        "E assert 12 == 4\nE + where 12 = evaluate('square(2)')"
+    )
+    incomplete = json.loads(_agent_report(
+        1, "application bug", [
+            "FAILED tests/generated/test_square.py::test_square_positive",
+            "E assert 12 == 4",
+        ]
+    ))
+    incomplete["failures"][0].pop("root_cause_evidence")
+    valid = _agent_report(1, "application bug", [
+        "FAILED tests/generated/test_square.py::test_square_positive",
+        "E assert 12 == 4",
+        "evaluate('square(2)')",
+    ])
+    workspace = _RepairWorkspace([
+        _result(1, stdout=output),
+        *_diagnosis_responses(json.dumps(incomplete)),
+        *_diagnosis_responses(valid),
+        _result(0, stdout="33 passed"),
+    ])
+    conversation = _Conversation()
+
+    final, attempts = run_repair_loop(workspace, conversation, "full-suite", 1)
+
+    assert final.exit_code == 0
+    assert attempts[0]["diagnosis_correction"] == "validated"
+    assert attempts[0]["diagnosis"]["failing_test"] == "tests/generated/test_square.py::test_square_positive"
+    assert attempts[0]["repair_status"] == "repair_verified"
+    assert workspace.commands.count("full-suite") == 2
+    assert len(conversation.messages) == 3  # diagnose, correct report, repair
+    assert "Replace the complete `failures` entry" in conversation.messages[1]
+    assert "Preserve every other entry" in conversation.messages[1]
+
+
+def test_rejected_diagnosis_correction_still_blocks_application_repair():
+    output = "FAILED tests/generated/test_square.py::test_square_positive\nE assert 12 == 4"
+    invalid = json.loads(_agent_report(1, "application bug", [
+        "FAILED tests/generated/test_square.py::test_square_positive",
+        "E assert 12 == 4",
+    ]))
+    invalid["failures"][0].pop("root_cause_evidence")
+    workspace = _RepairWorkspace([
+        _result(1, stdout=output),
+        *_diagnosis_responses(json.dumps(invalid)),
+        *_diagnosis_responses(json.dumps(invalid)),
+    ])
+    conversation = _Conversation()
+
+    final, attempts = run_repair_loop(workspace, conversation, "full-suite", 1)
+
+    assert final.exit_code == 1
+    assert attempts[0]["diagnosis_correction"] == "rejected"
+    assert attempts[0]["repair_decision"] == "human_review"
+    assert not any("minimal correction" in message for message in conversation.messages)
+
+
+def test_diagnosis_correction_checks_both_existing_test_guards():
+    output = "FAILED tests/generated/test_square.py::test_square_positive\nE assert 12 == 4"
+    invalid = json.loads(_agent_report(1, "application bug", [
+        "FAILED tests/generated/test_square.py::test_square_positive",
+        "E assert 12 == 4",
+    ]))
+    invalid["failures"][0].pop("root_cause_evidence")
+    valid = _agent_report(1, "application bug", [
+        "FAILED tests/generated/test_square.py::test_square_positive",
+        "E assert 12 == 4",
+    ])
+
+    # The production callback combines these two existing integrity guards.
+    # Exercise each failure independently at the post-correction checkpoint.
+    for changed_guard in ("generated", "repository"):
+        calls = {"generated": 0, "repository": 0}
+
+        def integrity_guard():
+            results = {}
+            for name in calls:
+                calls[name] += 1
+                changed = name == changed_guard and calls[name] == 4
+                results[name] = {
+                    "unchanged": not changed,
+                    "changed_paths": [
+                        "tests/generated/test_square.py"
+                        if name == "generated" else "tests/test_calculator.py"
+                    ] if changed else [],
+                    "errors": [],
+                    "restored": changed,
+                }
+            return {
+                "unchanged": all(item["unchanged"] for item in results.values()),
+                "changed_paths": [path for item in results.values() for path in item["changed_paths"]],
+                "errors": [],
+                "restored": any(item["restored"] for item in results.values()),
+            }
+
+        workspace = _RepairWorkspace([
+            _result(1, stdout=output),
+            *_diagnosis_responses(json.dumps(invalid)),
+            *_diagnosis_responses(valid),
+        ])
+        conversation = _Conversation()
+        final, attempts = run_repair_loop(
+            workspace, conversation, "full-suite", 1,
+            generated_tests_guard=integrity_guard,
+        )
+
+        assert final.exit_code == 1
+        assert calls == {"generated": 4, "repository": 4}
+        assert attempts[0]["diagnosis_correction_test_integrity"]["unchanged"] is False
+        assert attempts[0]["repair_decision"] == "human_review"
+        assert len(conversation.messages) == 2  # diagnosis and report correction only
+
+
 def test_full_suite_is_rerun_after_each_repair_and_verifies_each_result():
     output = "FAILED tests/test_math.py::test_add\nE AssertionError: expected 3, got 2"
     workspace = _RepairWorkspace([
@@ -219,7 +334,10 @@ def test_existing_test_change_during_diagnosis_blocks_repair():
 
 def test_repair_loop_does_not_repair_unclassified_or_infrastructure_failure():
     output = "FAILED tests/test_imports.py::test_import\nModuleNotFoundError: No module named 'vendor_lib'"
-    report = _agent_report(1, "application bug", ["ModuleNotFoundError: No module named 'vendor_lib'"])
+    report = _agent_report(1, "application bug", [
+        "tests/test_imports.py::test_import",
+        "ModuleNotFoundError: No module named 'vendor_lib'",
+    ])
     workspace = _RepairWorkspace([
         _result(1, stdout=output),
         *_diagnosis_responses(report),
@@ -514,10 +632,44 @@ def test_failure_artifacts_include_test_results_and_repair_history(tmp_path):
         "repair_history": [{"attempt": 1, "decision": "human_review"}],
     }))
 
-    ensure_failure_artifacts(tmp_path, "RuntimeError")
+    sample_traceback = "Traceback (most recent call last):\\nRuntimeError: test failure"
+    ensure_failure_artifacts(
+        tmp_path,
+        "RuntimeError",
+        sample_traceback,
+    )
 
+    report = json.loads(report_path.read_text())
     results = json.loads((tmp_path / "openhands-test-results.json").read_text())
     history = json.loads((tmp_path / "openhands-repair-history.json").read_text())
+    assert report["workflow_error"] == "RuntimeError"
+    assert report["workflow_traceback"] == sample_traceback
     assert results["attempts"] == [{"attempt": 1, "exit_code": 1}]
     assert history == [{"attempt": 1, "decision": "human_review"}]
     assert (tmp_path / "openhands-application.patch").is_file()
+
+
+def test_sandbox_test_command_starts_with_clean_environment():
+    from pr_test_harness import sandbox_test_command
+
+    command = sandbox_test_command("pytest -q")
+
+    assert "env -i" in command
+    assert command.startswith("cd /workspace && env -i")
+    assert "pytest -q" in command
+
+
+def test_sandbox_test_command_does_not_forward_api_credentials():
+    from pr_test_harness import sandbox_test_command
+
+    command = sandbox_test_command("pytest")
+
+    forbidden = [
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "SESSION_API_KEY",
+        "LLM_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+    ]
+    for secret in forbidden:
+        assert secret not in command
