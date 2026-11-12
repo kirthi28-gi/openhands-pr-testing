@@ -4,15 +4,20 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tarfile
+import traceback
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from pydantic import SecretStr
+# The workflow invokes this file from the trusted checkout, but Python's
+# import path can differ when it is loaded as a module or by test tooling.
+# Keep the trusted sibling harness resolvable in either execution mode.
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-from openhands.sdk import LLM, Conversation
-from openhands.tools.preset.default import get_default_agent
-from openhands.workspace import DockerWorkspace
 from pr_test_harness import (
     ensure_failure_artifacts,
     capture_generated_tests_snapshot,
@@ -24,11 +29,18 @@ from pr_test_harness import (
     load_agent_report,
     normalize_unified_git_patch,
     run_repair_loop,
+    run_environment_recovery,
     sandbox_test_command,
     update_validation_marker,
     validate_test_command,
     verify_test_environment,
 )
+
+from pydantic import SecretStr
+
+from openhands.sdk import LLM, Conversation
+from openhands.tools.preset.default import get_default_agent
+from openhands.workspace import DockerWorkspace
 
 
 def run_checked(workspace, command, timeout=600):
@@ -224,6 +236,7 @@ def _main():
         with DockerWorkspace(
             server_image=server_image,
             platform=docker_platform,
+            network="bridge",
             forward_env=["SESSION_API_KEY", "OH_SESSION_API_KEYS_0"],
         ) as workspace:
 
@@ -463,6 +476,7 @@ Do not stop after describing the tests. Create the files.
             original_repository_tests_manifest = None
             repository_tests_initial_integrity = None
             agent_error = None
+            conversation_error = None
 
             try:
                 # Remove stale readiness markers before agent preparation.
@@ -504,6 +518,7 @@ Do not stop after describing the tests. Create the files.
                     conversation.run()
                 except Exception as exc:
                     agent_error = type(exc).__name__
+                    conversation_error = traceback.format_exc()
 
                 # Existing generated tests are immutable; new tests may be
                 # added only if the pre-existing snapshot still matches.
@@ -621,6 +636,23 @@ Do not stop after describing the tests. Create the files.
                     environment_verification["failures"].append(message)
                     environment_verification["blockers"].append(message)
                     environment_ready = False
+                if (
+                    not environment_ready
+                    and validated_command is not None
+                    and generated_tests_manifest is not None
+                    and original_repository_tests_manifest is not None
+                ):
+                    environment_verification, _ = run_environment_recovery(
+                        workspace,
+                        conversation,
+                        environment_verification,
+                        lambda: verify_test_environment(
+                            workspace, repo_path, validated_command
+                        ),
+                        max_attempts=int(os.getenv("MAX_ENVIRONMENT_REPAIR_ATTEMPTS", "2")),
+                        integrity_guard=generated_tests_guard,
+                    )
+                    environment_ready = environment_verification.get("ready", False)
                 if environment_ready:
                     try:
                         test_command = sandbox_test_command(validated_command)
@@ -799,6 +831,7 @@ Do not stop after describing the tests. Create the files.
                     report, attempt_records, environment_ready
                 ),
                 "runner_error": agent_error,
+                "conversation_error": conversation_error,
                 "verified_test_results": [
                     item for item in attempt_records
                     if isinstance(item.get("exit_code"), int)
@@ -975,7 +1008,11 @@ def main():
     except Exception as exc:
         automation_dir = Path(os.getenv("AUTOMATION_DIR", ".")).resolve()
         output_dir = automation_dir / "generated-tests"
-        ensure_failure_artifacts(output_dir, type(exc).__name__)
+        ensure_failure_artifacts(
+            output_dir,
+            type(exc).__name__,
+            traceback.format_exc(),
+        )
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")
         if summary_path:
             with open(summary_path, "a", encoding="utf-8") as summary:
