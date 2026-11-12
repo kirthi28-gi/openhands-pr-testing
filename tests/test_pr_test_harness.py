@@ -15,6 +15,7 @@ from pr_test_harness import (
     generated_tests_manifest_from_archive,
     repository_test_manifest_from_archive,
     run_repair_loop,
+    sandbox_test_command,
     validate_repair_diagnosis,
 )
 
@@ -673,3 +674,11 @@ def test_sandbox_test_command_does_not_forward_api_credentials():
     ]
     for secret in forbidden:
         assert secret not in command
+
+
+def test_sandbox_test_command_does_not_insert_env_double_dash():
+    command = sandbox_test_command("python -m pytest")
+
+    assert "env -i" in command
+    assert "env -i --" not in command
+    assert command.endswith("python -m pytest")
