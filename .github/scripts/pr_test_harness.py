@@ -989,7 +989,7 @@ def sandbox_test_command(command: str) -> str:
             f'{name}="${{{name}:-{default}}}"'
         )
 
-    return "cd /workspace && " + " ".join(environment_args) + " -- " + shlex.join(argv)
+    return "cd /workspace && " + " ".join(environment_args) + " " + shlex.join(argv)
 
 
 def generated_tests_manifest_from_archive(archive_path: Path) -> dict:
