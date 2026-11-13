@@ -21,6 +21,7 @@ class SafeEvaluator:
         ast.Sub: operator.sub,
         ast.Mult: operator.mul,
         ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
         ast.Pow: operator.pow,
         ast.Mod: operator.mod,
     }
