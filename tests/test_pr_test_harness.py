@@ -1,21 +1,32 @@
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".github/scripts"))
 
 from pr_test_harness import (
+    _python_interpreter_probe_command,
+    _venv_runner_kind,
     ensure_failure_artifacts,
     ensure_generated_tests_unchanged,
     ensure_repository_tests_unchanged,
     generated_tests_manifest_from_archive,
     repository_test_manifest_from_archive,
+    resolve_python_environment,
+    resolve_python_interpreter,
     run_repair_loop,
+    sandbox_test_command,
     validate_repair_diagnosis,
+    validate_test_command,
+    verify_test_environment,
 )
 
 
@@ -652,7 +663,9 @@ def test_failure_artifacts_include_test_results_and_repair_history(tmp_path):
 def test_sandbox_test_command_starts_with_clean_environment():
     from pr_test_harness import sandbox_test_command
 
-    command = sandbox_test_command("pytest -q")
+    command = sandbox_test_command(
+        "pytest -q", python_interpreter="/workspace/.venv/bin/python"
+    )
 
     assert "env -i" in command
     assert command.startswith("cd /workspace && env -i")
@@ -662,7 +675,9 @@ def test_sandbox_test_command_starts_with_clean_environment():
 def test_sandbox_test_command_does_not_forward_api_credentials():
     from pr_test_harness import sandbox_test_command
 
-    command = sandbox_test_command("pytest")
+    command = sandbox_test_command(
+        "pytest", python_interpreter="/workspace/.venv/bin/python"
+    )
 
     forbidden = [
         "OPENAI_API_KEY",
@@ -673,3 +688,708 @@ def test_sandbox_test_command_does_not_forward_api_credentials():
     ]
     for secret in forbidden:
         assert secret not in command
+
+
+def test_sandbox_test_command_invokes_pytest_through_selected_interpreter():
+    """Regression: bare pytest must not be looked up on the sanitized PATH."""
+    interpreter = "/workspace/.venv/bin/python"
+
+    command = sandbox_test_command("pytest -q", python_interpreter=interpreter)
+
+    assert command.startswith("cd /workspace && env -i")
+    assert f"{interpreter} -m pytest -q" in command
+    assert 'VIRTUAL_ENV="/workspace/.venv"' in command
+    assert 'PATH="/workspace/.venv/bin:${PATH:-' in command
+
+
+def test_sandbox_test_command_supports_non_default_venv_locations():
+    interpreter = "/opt/project-envs/qa/bin/python"
+
+    command = sandbox_test_command("pytest", python_interpreter=interpreter)
+
+    assert f"{interpreter} -m pytest" in command
+    assert 'VIRTUAL_ENV="/opt/project-envs/qa"' in command
+    assert 'PATH="/opt/project-envs/qa/bin:${PATH:-' in command
+
+
+def test_sandbox_test_command_maps_venv_pytest_path_to_sibling_interpreter():
+    command = sandbox_test_command(".venv/bin/pytest -q")
+
+    assert ".venv/bin/python -m pytest -q" in command
+    assert 'VIRTUAL_ENV="/workspace/.venv"' in command
+
+
+def test_sandbox_test_command_maps_absolute_workspace_pytest_to_sibling():
+    command = sandbox_test_command("/workspace/custom/bin/pytest -q")
+
+    assert "/workspace/custom/bin/python -m pytest -q" in command
+    assert 'VIRTUAL_ENV="/workspace/custom"' in command
+    assert 'PATH="/workspace/custom/bin:${PATH:-' in command
+
+
+def test_sandbox_test_command_points_environment_at_the_command_venv():
+    """A command that names its own venv must not inherit a different one."""
+    command = sandbox_test_command(
+        "venv/bin/pytest -q", python_interpreter="/workspace/.venv/bin/python"
+    )
+
+    assert "venv/bin/python -m pytest -q" in command
+    assert 'VIRTUAL_ENV="/workspace/venv"' in command
+    assert 'PATH="/workspace/venv/bin:${PATH:-' in command
+    assert 'VIRTUAL_ENV="/workspace/.venv"' not in command
+    assert 'PATH="/workspace/.venv/bin:' not in command
+
+
+def test_sandbox_test_command_preserves_uv_poetry_and_pipenv_wrappers():
+    interpreter = "/workspace/.venv/bin/python"
+    for command in (
+        "uv run --offline --no-sync -- pytest",
+        "poetry run pytest",
+        "pipenv run pytest",
+    ):
+        sandboxed = sandbox_test_command(command, python_interpreter=interpreter)
+        assert sandboxed.endswith(" " + command)
+        assert "env -i" in sandboxed
+
+
+def test_sandbox_test_command_venv_environment_does_not_expose_secrets():
+    command = sandbox_test_command(
+        "pytest", python_interpreter="/workspace/.venv/bin/python"
+    )
+
+    for secret in (
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "SESSION_API_KEY",
+        "LLM_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+    ):
+        assert secret not in command
+
+
+def test_sandbox_test_command_refuses_to_inject_unsafe_interpreter_paths():
+    from pr_test_harness import EnvironmentResolutionError
+
+    with pytest.raises(EnvironmentResolutionError):
+        sandbox_test_command("pytest", python_interpreter='/tmp/ev"il/bin/python')
+
+
+class _EnvironmentWorkspace:
+    def __init__(self, interpreter):
+        self.interpreter = interpreter
+        self.commands = []
+
+    def execute_command(self, command, timeout=600):
+        self.commands.append(command)
+        if "OPENHANDS_PYTHON_ENV_PROBE" in command:
+            return _result(0, stdout=json.dumps({
+                "pytest_interpreter": self.interpreter,
+                "environment_interpreter": self.interpreter,
+            }))
+        return _result(0, stdout="Python 3.12.4\n1 test collected\n")
+
+
+def _python_repo(tmp_path):
+    root = tmp_path / "repo"
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "test_example.py").write_text(
+        "def test_example():\n    assert True\n"
+    )
+    return root
+
+
+def test_verify_test_environment_runs_pytest_through_selected_venv_interpreter(tmp_path):
+    """Regression for job 134611789975: `env: pytest: No such file or directory`."""
+    root = _python_repo(tmp_path)
+    interpreter = "/workspace/.venv/bin/python"
+    workspace = _EnvironmentWorkspace(interpreter)
+
+    verification = verify_test_environment(workspace, root, "pytest")
+
+    assert verification["ready"] is True
+    assert verification["python_interpreter"] == interpreter
+    assert verification["python_environment"]["interpreter"] == interpreter
+    assert verification["python_environment"]["source"] == "legacy"
+    checks = {entry["name"]: entry for entry in verification["checks"]}
+    runner_command = checks["python_test_runner"]["command"]
+    collection_command = checks["python_test_collection"]["command"]
+    assert f"{interpreter} -m pytest --version" in runner_command
+    assert f"{interpreter} -m pytest --collect-only -q" in collection_command
+    for command in (runner_command, collection_command):
+        assert "env -i" in command
+        assert 'VIRTUAL_ENV="/workspace/.venv"' in command
+        assert 'PATH="/workspace/.venv/bin:${PATH:-' in command
+    # No verification step may invoke pytest by name under the restricted PATH.
+    for command in workspace.commands:
+        if "pytest" in command and "OPENHANDS_PYTHON_ENV_PROBE" not in command:
+            assert "-m pytest" in command, command
+
+
+class _ProbeReportWorkspace:
+    """Return a fixed interpreter-probe report and simulate command outcomes."""
+
+    def __init__(self, report, fail_markers=()):
+        self.report = report
+        self.fail_markers = tuple(fail_markers)
+        self.commands = []
+
+    def execute_command(self, command, timeout=600):
+        self.commands.append(command)
+        if "OPENHANDS_PYTHON_ENV_PROBE" in command:
+            return _result(0, stdout=json.dumps(self.report))
+        if any(marker in command for marker in self.fail_markers):
+            return _result(
+                1,
+                stderr="/workspace/.venv/bin/python: No module named pytest",
+            )
+        return _result(0, stdout="Python 3.12.4\n1 test collected\n")
+
+
+def test_verification_and_suite_share_the_project_interpreter(tmp_path):
+    """Regression for job 134650669698: system Python without pytest was used."""
+    root = _python_repo(tmp_path)
+    interpreter = "/workspace/.venv/bin/python"
+    workspace = _ProbeReportWorkspace({"python_candidates": [
+        {
+            "path": "/usr/local/bin/python3",
+            "source": "path",
+            "has_pytest": False,
+            "is_venv": False,
+        },
+        {
+            "path": interpreter,
+            "source": "project",
+            "has_pytest": True,
+            "is_venv": True,
+        },
+    ]})
+
+    verification = verify_test_environment(workspace, root, "pytest")
+
+    assert verification["ready"] is True
+    assert verification["python_environment"]["interpreter"] == interpreter
+    assert verification["python_environment"]["source"] == "project"
+    checks = {entry["name"]: entry for entry in verification["checks"]}
+    for name in ("python_runtime", "python_test_runner", "python_test_collection"):
+        assert interpreter in checks[name]["command"], name
+    suite_command = sandbox_test_command(
+        verification["selected_test_command"],
+        python_interpreter=verification["python_interpreter"],
+    )
+    assert f"{interpreter} -m pytest" in suite_command
+    assert 'VIRTUAL_ENV="/workspace/.venv"' in suite_command
+    assert "/usr/local/bin/python3" not in suite_command
+
+
+def test_verification_fails_when_selected_environment_lacks_pytest(tmp_path):
+    """Never silently borrow a different interpreter's pytest installation."""
+    root = _python_repo(tmp_path)
+    interpreter = "/workspace/.venv/bin/python"
+    workspace = _ProbeReportWorkspace(
+        {"python_candidates": [
+            {
+                "path": interpreter,
+                "source": "project",
+                "has_pytest": False,
+                "is_venv": True,
+            },
+            {
+                "path": "/usr/local/bin/python3",
+                "source": "system",
+                "has_pytest": True,
+                "is_venv": False,
+            },
+        ]},
+        fail_markers=(interpreter,),
+    )
+
+    verification = verify_test_environment(workspace, root, "pytest")
+
+    assert verification["ready"] is False
+    assert verification["python_interpreter"] == interpreter
+    assert verification["python_environment"]["has_pytest"] is False
+    assert any(
+        "No module named pytest" in failure for failure in verification["failures"]
+    )
+    # The suite command still targets the prepared environment, so the failure
+    # is reported against the real environment instead of being masked.
+    suite_command = sandbox_test_command(
+        verification["selected_test_command"],
+        python_interpreter=verification["python_interpreter"],
+    )
+    assert f"{interpreter} -m pytest" in suite_command
+    assert "/usr/local/bin/python3" not in suite_command
+
+
+def test_verify_test_environment_preserves_wrapped_package_managers(tmp_path):
+    root = _python_repo(tmp_path)
+
+    cases = {
+        "poetry run pytest": ("poetry run ", "poetry run pytest"),
+        "pipenv run pytest": ("pipenv run ", "pipenv run pytest"),
+        "uv run --offline --no-sync -- pytest": (
+            "uv run --offline --no-sync ",
+            "uv run --offline --no-sync pytest",
+        ),
+    }
+    for command, (expected_prefix, expected_runner) in cases.items():
+        workspace = _EnvironmentWorkspace("/usr/bin/python3")
+        verification = verify_test_environment(workspace, root, command)
+        assert verification["ready"] is True
+        checks = {entry["name"]: entry for entry in verification["checks"]}
+        runner_command = checks["python_test_runner"]["command"]
+        assert expected_prefix in runner_command
+        # The wrapper must keep selecting its own environment: never bypass it
+        # with an interpreter resolved from elsewhere.
+        assert runner_command.endswith(" " + expected_runner + " --version")
+        assert "/usr/bin/python3" not in runner_command
+        assert checks["python_runtime"]["command"].endswith(" python --version")
+        assert "/usr/bin/python3" not in checks["python_runtime"]["command"]
+
+
+def test_sandbox_test_command_does_not_inject_environment_for_wrappers():
+    command = sandbox_test_command(
+        "poetry run pytest", python_interpreter="/usr/bin/python3"
+    )
+
+    assert command.endswith(" poetry run pytest")
+    assert 'VIRTUAL_ENV="/usr"' not in command
+    assert 'PATH="/usr/bin:' not in command
+
+
+def test_sandbox_test_command_does_not_treat_system_python_as_venv():
+    command = sandbox_test_command("pytest", python_interpreter="/usr/bin/python3")
+
+    assert "/usr/bin/python3 -m pytest" in command
+    assert 'VIRTUAL_ENV="/usr"' not in command
+    assert 'PATH="/usr/bin:' not in command
+
+
+def _clean_probe_env():
+    return {name: value for name, value in os.environ.items() if name != "VIRTUAL_ENV"}
+
+
+class _LocalProbeWorkspace:
+    """Run the interpreter probe locally instead of inside Docker."""
+
+    def __init__(self, cwd, env=None):
+        self.cwd = cwd
+        self.env = env
+
+    def execute_command(self, command, timeout=120):
+        command = command.replace("cd /workspace && ", "")
+        completed = subprocess.run(
+            command,
+            shell=True,
+            cwd=self.cwd,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        return _result(
+            completed.returncode, stdout=completed.stdout, stderr=completed.stderr
+        )
+
+
+def _write_stub_interpreter(path, pytest_exit_code=0):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        f'  *"import pytest"*) exit {pytest_exit_code};;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    path.chmod(0o755)
+
+
+def test_python_interpreter_probe_resolves_custom_venv_name(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    stub = root / "ci-venv" / "bin" / "python"
+    _write_stub_interpreter(stub)
+
+    interpreter = resolve_python_interpreter(
+        _LocalProbeWorkspace(str(root), env=_clean_probe_env()),
+        ["ci-venv/bin/python", "-m", "pytest"],
+    )
+
+    assert interpreter == str(stub)
+
+
+def test_python_interpreter_probe_prefers_environment_with_pytest(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    without_pytest = root / ".venv" / "bin" / "python"
+    _write_stub_interpreter(without_pytest, pytest_exit_code=1)
+    with_pytest = root / "venv" / "bin" / "python"
+    _write_stub_interpreter(with_pytest)
+
+    interpreter = resolve_python_interpreter(
+        _LocalProbeWorkspace(str(root), env=_clean_probe_env())
+    )
+
+    assert interpreter == str(with_pytest)
+
+
+def test_python_environment_discovers_nested_pyvenv_cfg(tmp_path):
+    """Arbitrarily named, nested project environments are found without PATH."""
+    root = tmp_path / "project"
+    root.mkdir()
+    environment_root = root / "envs" / "qa"
+    (environment_root / "bin").mkdir(parents=True)
+    (environment_root / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    stub = environment_root / "bin" / "python"
+    _write_stub_interpreter(stub)
+
+    environment = resolve_python_environment(
+        _LocalProbeWorkspace(str(root), env=_clean_probe_env())
+    )
+
+    assert environment["interpreter"] == str(stub)
+    assert environment["source"] == "project"
+    assert environment["venv_root"] == str(environment_root)
+    assert environment["has_pytest"] is True
+
+
+def test_python_environment_is_not_collapsed_into_symlinked_base_python(tmp_path):
+    """A venv interpreter symlinks to its base; dedup must keep the venv entry."""
+    root = tmp_path / "project"
+    system = root / "system" / "python3"
+    _write_stub_interpreter(system)
+    environment_root = root / "envs" / "qa"
+    (environment_root / "bin").mkdir(parents=True)
+    (environment_root / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    project_python = environment_root / "bin" / "python"
+    project_python.symlink_to(system)
+    env = _clean_probe_env()
+    env["PATH"] = f"{system.parent}:{env['PATH']}"
+
+    environment = resolve_python_environment(_LocalProbeWorkspace(str(root), env=env))
+
+    assert environment["source"] == "project"
+    assert environment["interpreter"] == str(project_python)
+    paths = {candidate["path"] for candidate in environment["candidates"]}
+    assert str(system) in paths
+    assert str(project_python) in paths
+
+
+def test_python_environment_does_not_substitute_system_pytest(tmp_path):
+    """System pytest must not replace a prepared project environment."""
+    report = {"python_candidates": [
+        {
+            "path": "/workspace/.venv/bin/python",
+            "source": "project",
+            "has_pytest": False,
+            "is_venv": True,
+        },
+        {
+            "path": "/usr/local/bin/python3",
+            "source": "system",
+            "has_pytest": True,
+            "is_venv": False,
+        },
+    ]}
+
+    class _ReportWorkspace:
+        def execute_command(self, command, timeout=120):
+            return _result(0, stdout=json.dumps(report))
+
+    environment = resolve_python_environment(_ReportWorkspace())
+
+    assert environment["interpreter"] == "/workspace/.venv/bin/python"
+    assert environment["source"] == "project"
+    assert environment["has_pytest"] is False
+
+
+def test_python_environment_ignores_non_venv_active_interpreter():
+    """A stale VIRTUAL_ENV=/usr must not outrank the project environment."""
+    report = {"python_candidates": [
+        {
+            "path": "/usr/bin/python3",
+            "source": "active",
+            "has_pytest": True,
+            "is_venv": False,
+        },
+        {
+            "path": "/workspace/.venv/bin/python",
+            "source": "project",
+            "has_pytest": True,
+            "is_venv": True,
+        },
+    ]}
+
+    class _ReportWorkspace:
+        def execute_command(self, command, timeout=120):
+            return _result(0, stdout=json.dumps(report))
+
+    environment = resolve_python_environment(_ReportWorkspace())
+
+    assert environment["interpreter"] == "/workspace/.venv/bin/python"
+    assert environment["source"] == "project"
+
+
+def test_python_environment_prefers_explicit_activation(tmp_path):
+    report = {"python_candidates": [
+        {
+            "path": "/workspace/.venv/bin/python",
+            "source": "project",
+            "has_pytest": True,
+            "is_venv": True,
+        },
+        {
+            "path": "/workspace/activated/bin/python",
+            "source": "active",
+            "has_pytest": True,
+            "is_venv": True,
+        },
+    ]}
+
+    class _ReportWorkspace:
+        def execute_command(self, command, timeout=120):
+            return _result(0, stdout=json.dumps(report))
+
+    environment = resolve_python_environment(_ReportWorkspace())
+
+    assert environment["interpreter"] == "/workspace/activated/bin/python"
+    assert environment["source"] == "active"
+
+
+def test_python_environment_accepts_legacy_probe_report():
+    class _LegacyWorkspace:
+        def execute_command(self, command, timeout=120):
+            return _result(0, stdout=json.dumps({
+                "pytest_interpreter": "/workspace/.venv/bin/python",
+                "environment_interpreter": "/usr/bin/python3",
+            }))
+
+    environment = resolve_python_environment(_LegacyWorkspace())
+
+    assert environment["interpreter"] == "/workspace/.venv/bin/python"
+    assert environment["has_pytest"] is True
+    assert environment["source"] == "legacy"
+
+
+def test_python_environment_probe_uses_sanitized_environment():
+    command = _python_interpreter_probe_command([".venv/bin/python"])
+
+    assert "env -i" in command
+    assert 'VIRTUAL_ENV="${VIRTUAL_ENV:-}"' in command
+    assert 'CONDA_PREFIX="${CONDA_PREFIX:-}"' in command
+    for secret in (
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "SESSION_API_KEY",
+        "LLM_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+    ):
+        assert secret not in command
+
+
+def test_python_environment_probe_does_not_expand_hostile_environment(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    marker = tmp_path / "pwned"
+    env = _clean_probe_env()
+    env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+    env["VIRTUAL_ENV"] = f'"; touch {marker}; #'
+    env["CONDA_PREFIX"] = f"$(touch {marker})"
+    env["SESSION_API_KEY"] = "probe-super-secret"
+
+    command = _python_interpreter_probe_command([]).replace(
+        "cd /workspace", f"cd {root}", 1
+    )
+    completed = subprocess.run(
+        command, shell=True, capture_output=True, text=True, env=env
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+    assert "probe-super-secret" not in completed.stdout
+
+
+def test_python_interpreter_probe_honors_virtual_env_with_custom_name(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    custom_env = root / "envs" / "qa"
+    stub = custom_env / "bin" / "python"
+    _write_stub_interpreter(stub)
+    env = _clean_probe_env()
+    env["VIRTUAL_ENV"] = str(custom_env)
+
+    interpreter = resolve_python_interpreter(
+        _LocalProbeWorkspace(str(root), env=env)
+    )
+
+    assert interpreter == str(stub)
+
+
+def test_python_interpreter_probe_does_not_dump_environment_values():
+    command = _python_interpreter_probe_command([".venv/bin/python"])
+
+    assert "printenv" not in command
+    assert "json.dumps(report)" in command
+
+
+def test_python_interpreter_probe_rejects_control_characters_in_paths():
+    class _ControlCharacterWorkspace:
+        def execute_command(self, command, timeout=120):
+            return _result(0, stdout=json.dumps({
+                "pytest_interpreter": "/workspace/.venv/bin/python\nrm -rf /",
+                "environment_interpreter": "/workspace/.venv/bin/python\n",
+            }))
+
+    assert resolve_python_interpreter(_ControlCharacterWorkspace()) is None
+
+
+def test_python_interpreter_probe_falls_back_to_python_when_python3_missing():
+    interpreter = "/workspace/.venv/bin/python"
+    commands = []
+
+    class _FallbackWorkspace:
+        def execute_command(self, command, timeout=120):
+            commands.append(command)
+            if "python3 - <<" in command:
+                return _result(127, stderr="python3: not found")
+            return _result(0, stdout=json.dumps({
+                "pytest_interpreter": interpreter,
+                "environment_interpreter": interpreter,
+            }))
+
+    assert resolve_python_interpreter(_FallbackWorkspace()) == interpreter
+    assert any("python3 - <<" in command for command in commands)
+    assert any(
+        "python - <<" in command and "python3 - <<" not in command
+        for command in commands
+    )
+
+
+def test_validate_test_command_accepts_venv_paths_and_rejects_escapes(tmp_path):
+    root = _python_repo(tmp_path)
+
+    assert validate_test_command("venv/bin/python -m pytest", root) == "venv/bin/python -m pytest"
+    assert validate_test_command(".venv/bin/pytest -q", root) == ".venv/bin/pytest -q"
+
+    for command in (
+        "../other/bin/python -m pytest",
+        "/etc/bin/python -m pytest",
+        "/workspace/../bin/python -m pytest",
+    ):
+        try:
+            validate_test_command(command, root)
+        except ValueError:
+            continue
+        raise AssertionError(f"unsafe runner path accepted: {command}")
+
+
+def test_venv_runner_kind_accepts_absolute_workspace_runners():
+    """Regression: PurePosixPath keeps '/' first, so '/workspace/...' was missed."""
+    assert _venv_runner_kind("/workspace/custom/bin/pytest") == "pytest"
+    assert _venv_runner_kind("/workspace/custom/bin/python") == "python"
+    assert _venv_runner_kind("/workspace/custom/bin/python3.12") == "python"
+    assert _venv_runner_kind("qa-env/bin/python") == "python"
+    assert _venv_runner_kind("qa-env/bin/pytest") == "pytest"
+
+    for token in (
+        "/etc/bin/pytest",
+        "/usr/bin/python3",
+        "/workspace/../bin/python",
+        "/workspace/custom/bin/nosetests",
+    ):
+        assert _venv_runner_kind(token) is None, token
+
+
+def test_validate_test_command_accepts_absolute_workspace_runners(tmp_path):
+    root = _python_repo(tmp_path)
+
+    assert (
+        validate_test_command("/workspace/custom/bin/pytest -q", root)
+        == "/workspace/custom/bin/pytest -q"
+    )
+    assert (
+        validate_test_command("/workspace/custom/bin/python -m pytest -q", root)
+        == "/workspace/custom/bin/python -m pytest -q"
+    )
+
+
+def test_validate_test_command_accepts_nested_venv_python_runner(tmp_path):
+    # The fixture must supply repository evidence (tests/test_example.py);
+    # validation still requires that Python runners be evidenced by the repo.
+    root = _python_repo(tmp_path)
+
+    assert (
+        validate_test_command("qa-env/bin/python -m pytest -q", root)
+        == "qa-env/bin/python -m pytest -q"
+    )
+
+
+def test_validate_test_command_still_requires_python_evidence(tmp_path):
+    root = tmp_path / "repo"
+    (root / "qa-env" / "bin").mkdir(parents=True)
+
+    for command in (
+        "qa-env/bin/python -m pytest -q",
+        "/workspace/custom/bin/pytest -q",
+    ):
+        try:
+            validate_test_command(command, root)
+        except ValueError:
+            continue
+        raise AssertionError(f"runner accepted without repository evidence: {command}")
+
+
+def _write_logging_interpreter(path, log_path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" > "{log_path}"\n'
+        "exit 0\n"
+    )
+    path.chmod(0o755)
+
+
+def test_sandbox_test_command_executes_without_venv_on_path(tmp_path):
+    """Reproduce the CI failure mode: no pytest on the restricted PATH."""
+    root = tmp_path / "workspace"
+    log = tmp_path / "invocation.txt"
+    interpreter_path = root / ".venv" / "bin" / "python"
+    _write_logging_interpreter(interpreter_path, log)
+
+    command = sandbox_test_command(
+        "pytest -q", python_interpreter=str(interpreter_path)
+    ).replace("cd /workspace", f"cd {root}", 1)
+    completed = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert log.read_text().strip() == "-m pytest -q"
+
+
+def test_sandbox_test_command_maps_venv_pytest_entry_point_to_interpreter(tmp_path):
+    root = tmp_path / "workspace"
+    log = tmp_path / "invocation.txt"
+    interpreter_path = root / ".venv" / "bin" / "python"
+    _write_logging_interpreter(interpreter_path, log)
+
+    plan_command = sandbox_test_command(".venv/bin/pytest -q")
+    assert ".venv/bin/python -m pytest -q" in plan_command
+    # The plan pins the sandbox-absolute interpreter. Rewrite both the working
+    # directory and that path so the same rendering can execute locally.
+    command = plan_command.replace("cd /workspace", f"cd {root}", 1).replace(
+        "/workspace/.venv", f"{root}/.venv"
+    )
+    completed = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert log.read_text().strip() == "-m pytest -q"
