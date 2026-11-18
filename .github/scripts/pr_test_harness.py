@@ -11,6 +11,7 @@ import shlex
 import sys
 import tarfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
@@ -55,6 +56,166 @@ _JS_TEST_RUNNERS = {
     "jest", "vitest", "mocha", "ava", "tap", "node:test",
     "react-scripts", "vue-cli-service", "ng",
 }
+
+#: Default ``PATH`` used when the sandbox shell environment is not consulted.
+SANDBOX_PATH_DEFAULT = (
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+#: Extra user-level bin directories where wrappers such as Poetry/Pipenv are
+#: commonly installed inside agent sandboxes.
+_SANDBOX_USER_BIN = ("/home/openhands/.local/bin", "/root/.local/bin")
+#: Deterministic, non-secret environment shared by every sandboxed command.
+SANDBOX_ENV_DEFAULTS = {
+    "HOME": "/tmp",
+    "LANG": "C.UTF-8",
+    "SHELL": "/bin/sh",
+    "PWD": "/workspace",
+    "TERM": "xterm",
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+}
+#: Non-identity variables inherited from the host only when safe.
+#: Identity variables such as ``USER``/``VIRTUAL_ENV``/``PYTHONPATH`` are never
+#: inherited; the plan supplies them or leaves them unset.
+_SANDBOX_OPTIONAL_ENV = (
+    "CI",
+    "DEBIAN_FRONTEND",
+    "LC_ALL",
+    "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+)
+PLAN_SCHEMA_VERSION = 1
+
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_UNSAFE_ENV_VALUE_RE = re.compile(r'["`$\\\n\r\x00]')
+
+
+class EnvironmentResolutionError(RuntimeError):
+    """Raised when no safe, evidence-backed test execution plan exists.
+
+    The error carries structured evidence so the caller can persist a
+    fail-safe report instead of running a command against an unknown
+    interpreter.
+    """
+
+    def __init__(self, message: str, evidence: dict | None = None):
+        super().__init__(message)
+        self.evidence = dict(evidence or {})
+
+
+def _execution_plan_digest(
+    argv: tuple[str, ...],
+    env: dict[str, str],
+    interpreter: str | None,
+    venv_root: str | None,
+    framework: str,
+    ecosystem: str,
+    source: str,
+) -> str:
+    """Return a stable digest of everything that determines execution."""
+    payload = json.dumps(
+        {
+            "argv": list(argv),
+            "env": dict(sorted(env.items())),
+            "interpreter": interpreter,
+            "venv_root": venv_root,
+            "framework": framework,
+            "ecosystem": ecosystem,
+            "source": source,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class TestExecutionPlan:
+    """The single source of truth for one repository test execution.
+
+    A plan resolves the command shape, interpreter, virtual environment,
+    sanitized environment, and framework exactly once. Verification, recovery,
+    collection, and the final suite all consume the same plan, so the
+    environment that is checked is the environment that runs the tests.
+    """
+
+    # Prevent pytest from trying to collect this dataclass as a test class
+    # when a test module imports it.
+    __test__ = False
+
+    argv: tuple[str, ...]
+    env: dict[str, str]
+    interpreter: str | None
+    venv_root: str | None
+    framework: str
+    ecosystem: str
+    source: str
+    evidence: dict = field(default_factory=dict)
+    wrapper: tuple[str, ...] = ()
+    runner: tuple[str, ...] = ()
+    digest: str = ""
+
+    def __post_init__(self):
+        object.__setattr__(self, "argv", tuple(self.argv))
+        object.__setattr__(self, "env", dict(self.env))
+        object.__setattr__(self, "wrapper", tuple(self.wrapper))
+        object.__setattr__(self, "runner", tuple(self.runner))
+        if not self.argv or not all(
+            isinstance(item, str) and item for item in self.argv
+        ):
+            raise ValueError("execution plan argv must contain non-empty strings")
+        computed = _execution_plan_digest(
+            self.argv,
+            self.env,
+            self.interpreter,
+            self.venv_root,
+            self.framework,
+            self.ecosystem,
+            self.source,
+        )
+        if self.digest and self.digest != computed:
+            raise ValueError("execution plan digest does not match its contents")
+        if not self.digest:
+            object.__setattr__(self, "digest", computed)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TestExecutionPlan":
+        """Rehydrate a plan previously persisted in a report artifact."""
+        if not isinstance(data, dict):
+            raise ValueError("execution plan must be an object")
+        required = ("argv", "env", "framework", "ecosystem", "source")
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise ValueError(f"execution plan is missing keys: {', '.join(missing)}")
+        return cls(
+            argv=tuple(data["argv"]),
+            env=dict(data["env"]),
+            interpreter=data.get("interpreter"),
+            venv_root=data.get("venv_root"),
+            framework=data["framework"],
+            ecosystem=data["ecosystem"],
+            source=data["source"],
+            evidence=dict(data.get("evidence") or {}),
+            wrapper=tuple(data.get("wrapper") or ()),
+            runner=tuple(data.get("runner") or ()),
+            digest=str(data.get("digest") or ""),
+        )
+
+    def to_dict(self) -> dict:
+        """Serialize the plan without secrets (the plan never contains any)."""
+        return {
+            "schema_version": PLAN_SCHEMA_VERSION,
+            "argv": list(self.argv),
+            "env": dict(sorted(self.env.items())),
+            "interpreter": self.interpreter,
+            "venv_root": self.venv_root,
+            "framework": self.framework,
+            "ecosystem": self.ecosystem,
+            "source": self.source,
+            "wrapper": list(self.wrapper),
+            "runner": list(self.runner),
+            "evidence": self.evidence,
+            "digest": self.digest,
+        }
 
 
 def detect_python_manifests(
@@ -663,9 +824,10 @@ def validate_test_command(command: str, repository_root: Path) -> str:
 
 def _run_verification_check(
     workspace, checks: list[dict], name: str, argv: list[str],
-    python_interpreter: str | None = None,
+    plan: TestExecutionPlan,
 ) -> bool:
-    command = sandbox_test_command(shlex.join(argv), python_interpreter=python_interpreter)
+    """Run one check with the plan's interpreter and sanitized environment."""
+    command = sandbox_test_command(plan, argv=argv)
     try:
         result = workspace.execute_command(command, timeout=600)
         stdout = result.stdout or ""
@@ -745,9 +907,11 @@ def _python_verification_parts(
                 [interpreter, "-m", "pytest", *runner[1:]],
                 "pytest",
             )
-        # No environment interpreter was resolved; keep the PATH-resolved
-        # entry point for system-level installations.
-        return wrapper, "python", list(runner), "pytest"
+        raise EnvironmentResolutionError(
+            "A bare Python runner was validated without a resolved interpreter; "
+            "refusing to use whatever pytest happens to be on PATH.",
+            evidence={"tokens": tokens},
+        )
     if (
         runner[0] in {"python", "python3"}
         or kind == "python"
@@ -1070,6 +1234,268 @@ def resolve_python_interpreter(workspace, tokens: list[str] | None = None) -> st
     return environment["interpreter"] if environment else None
 
 
+def _split_python_run_shape(tokens: list[str]) -> tuple[list[str], list[str]]:
+    """Split a validated Python command into wrapper and runner tokens."""
+    if tokens[0] == "uv":
+        wrapper = tokens[:4]
+        runner = tokens[4:]
+        if runner and runner[0] == "--":
+            runner = runner[1:]
+        return wrapper, runner
+    if tokens[0] in {"poetry", "pipenv"}:
+        return tokens[:2], tokens[2:]
+    return [], list(tokens)
+
+
+def _absolute_workspace_path(path: str) -> str:
+    """Make a sandbox-relative path absolute without leaving the workspace."""
+    return path if path.startswith("/") else "/workspace/" + path
+
+
+def _build_sandbox_env(venv_root: str | None = None) -> dict[str, str]:
+    """Build the deterministic, non-secret environment for a plan.
+
+    Host secrets are never copied. Only a small allowlist of display/CI
+    controls may be inherited, and only when the value is safe to embed.
+    """
+    default_path = ":".join([*_SANDBOX_USER_BIN, SANDBOX_PATH_DEFAULT])
+    env = dict(SANDBOX_ENV_DEFAULTS)
+    if venv_root:
+        env["PATH"] = f"{venv_root}/bin:{default_path}"
+        env["VIRTUAL_ENV"] = venv_root
+    else:
+        env["PATH"] = default_path
+    for name in _SANDBOX_OPTIONAL_ENV:
+        value = os.environ.get(name)
+        if (
+            value
+            and not _UNSAFE_ENV_VALUE_RE.search(value)
+            and not _has_control_characters(value)
+        ):
+            env[name] = value
+    return env
+
+
+def _python_execution_plan(
+    tokens: list[str],
+    interpreter: str | None = None,
+    requested_command: str | None = None,
+    environment: dict | None = None,
+) -> TestExecutionPlan:
+    """Create a Python plan from validated tokens and optional probe evidence."""
+    wrapper, runner = _split_python_run_shape(tokens)
+    requested = requested_command or shlex.join(tokens)
+
+    if wrapper:
+        _wrapper, _interpreter, resolved_runner, framework = _python_verification_parts(
+            tokens, None
+        )
+        return TestExecutionPlan(
+            # Wrappers select their own environment; preserve the validated
+            # argv exactly (including any ``--`` separator) for the suite.
+            argv=tuple(tokens),
+            env=_build_sandbox_env(None),
+            interpreter=None,
+            venv_root=None,
+            framework=framework,
+            ecosystem="python",
+            source="wrapper",
+            evidence={
+                "requested_command": requested,
+                "resolution": "wrapper selects its own environment",
+                "wrapper": wrapper,
+            },
+            wrapper=tuple(wrapper),
+            runner=tuple(resolved_runner),
+        )
+
+    # A command that names its own virtual environment is authoritative: it
+    # must run in that environment even if the probe selected another one.
+    # Normalize relative workspace runners to absolute paths so the plan does
+    # not depend on the shell's working directory.
+    kind = _venv_runner_kind(runner[0]) if runner else None
+    normalized = list(tokens)
+    command_interpreter = None
+    if kind == "pytest":
+        command_interpreter = _absolute_workspace_path(
+            _interpreter_sibling_python(runner[0])
+        )
+        normalized[0] = _absolute_workspace_path(normalized[0])
+    elif kind == "python":
+        command_interpreter = _absolute_workspace_path(runner[0])
+        normalized[0] = command_interpreter
+
+    evidence = {"requested_command": requested}
+    if command_interpreter:
+        selected = command_interpreter
+        venv_root = _venv_root_for_interpreter(selected)
+        source = (environment or {}).get("source") or "command"
+        if environment is not None and environment.get("interpreter") != selected:
+            evidence["command_environment_override"] = {
+                "probe_interpreter": environment.get("interpreter"),
+                "command_interpreter": selected,
+            }
+    else:
+        selected = (environment or {}).get("interpreter")
+        if not selected and interpreter and _valid_python_interpreter_path(interpreter):
+            selected = interpreter
+        venv_root = (environment or {}).get("venv_root") or _venv_root_for_interpreter(
+            selected
+        )
+        source = (environment or {}).get("source") or "command"
+
+    if not selected or not _valid_python_interpreter_path(selected):
+        raise EnvironmentResolutionError(
+            "The validated Python command does not name a resolvable interpreter "
+            "and no sandbox interpreter was resolved.",
+            evidence={
+                "requested_command": requested,
+                "interpreter": interpreter,
+                "python_environment": environment,
+            },
+        )
+
+    wrapper, resolved_interpreter, resolved_runner, framework = (
+        _python_verification_parts(normalized, selected)
+    )
+    if venv_root is None:
+        venv_root = _venv_root_for_interpreter(resolved_interpreter)
+    evidence["resolved_interpreter"] = resolved_interpreter
+    if environment is not None:
+        evidence["python_environment"] = environment
+        if (
+            framework == "pytest"
+            and environment.get("interpreter") == resolved_interpreter
+            and environment.get("has_pytest") is False
+        ):
+            evidence["framework_available"] = False
+    return TestExecutionPlan(
+        argv=tuple([*wrapper, *resolved_runner]),
+        env=_build_sandbox_env(venv_root),
+        interpreter=resolved_interpreter,
+        venv_root=venv_root,
+        framework=framework,
+        ecosystem="python",
+        source=source,
+        evidence=evidence,
+        wrapper=tuple(wrapper),
+        runner=tuple(resolved_runner),
+    )
+
+
+def test_execution_plan_from_command(
+    command: str | TestExecutionPlan,
+    python_interpreter: str | None = None,
+) -> TestExecutionPlan:
+    """Build a plan without probing a workspace.
+
+    Used for non-Python commands, reporting, and as the strict compatibility
+    layer for ``sandbox_test_command``. A Python command that does not name a
+    resolvable interpreter raises ``EnvironmentResolutionError`` instead of
+    silently falling back to a PATH lookup.
+    """
+    if isinstance(command, TestExecutionPlan):
+        return command
+    tokens = shlex.split(command) if isinstance(command, str) else [str(item) for item in command]
+    if not tokens:
+        raise EnvironmentResolutionError("The test command is empty.")
+    if _python_runner(tokens):
+        return _python_execution_plan(
+            tokens, interpreter=python_interpreter, requested_command=shlex.join(tokens)
+        )
+    if tokens[0] in {"npm", "pnpm", "yarn"}:
+        ecosystem, framework = "javascript", Path(tokens[0]).name
+    elif tokens[0] in {"mvn", "gradle"}:
+        ecosystem, framework = "java", tokens[0]
+    else:
+        raise EnvironmentResolutionError(
+            "The command is not a supported test runner and cannot be rendered "
+            "without an execution plan.",
+            evidence={"requested_command": shlex.join(tokens)},
+        )
+    return TestExecutionPlan(
+        argv=tuple(tokens),
+        env=_build_sandbox_env(None),
+        interpreter=None,
+        venv_root=None,
+        framework=framework,
+        ecosystem=ecosystem,
+        source="command",
+        evidence={"requested_command": shlex.join(tokens)},
+    )
+
+
+# This helper is a constructor, not a test; prevent pytest collection when a
+# test module imports it directly.
+test_execution_plan_from_command.__test__ = False
+
+
+def resolve_test_execution_plan(
+    workspace, repository_root: Path, test_command: str
+) -> TestExecutionPlan:
+    """Resolve the one execution plan used for verification and execution.
+
+    Raises ``EnvironmentResolutionError`` with structured evidence when no safe
+    plan exists, so callers fail closed instead of executing a bare command
+    against an unknown interpreter.
+    """
+    validated = validate_test_command(test_command, repository_root)
+    tokens = shlex.split(validated)
+
+    if _python_runner(tokens):
+        wrapper, _runner = _split_python_run_shape(tokens)
+        if wrapper:
+            return _python_execution_plan(
+                tokens, requested_command=validated
+            )
+        try:
+            environment = resolve_python_environment(workspace, tokens)
+        except Exception as exc:
+            raise EnvironmentResolutionError(
+                "Python interpreter probing could not complete.",
+                evidence={
+                    "requested_command": validated,
+                    "probe_error": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+        if environment is None:
+            raise EnvironmentResolutionError(
+                "No Python interpreter could be resolved inside the sandbox.",
+                evidence={
+                    "requested_command": validated,
+                    "tokens": tokens,
+                    "probe": "no usable interpreter returned",
+                },
+            )
+        return _python_execution_plan(
+            tokens,
+            interpreter=environment["interpreter"],
+            requested_command=validated,
+            environment=environment,
+        )
+
+    if tokens[0] in {"npm", "pnpm", "yarn"}:
+        _package, script_tokens = _javascript_script_tokens(repository_root)
+        ecosystem, framework = "javascript", _javascript_framework(script_tokens)
+    elif tokens[0] in {"mvn", "gradle"}:
+        ecosystem, framework = "java", tokens[0]
+    else:
+        raise EnvironmentResolutionError(
+            "The validated command could not be mapped to a supported ecosystem.",
+            evidence={"requested_command": validated, "tokens": tokens},
+        )
+    return TestExecutionPlan(
+        argv=tuple(tokens),
+        env=_build_sandbox_env(None),
+        interpreter=None,
+        venv_root=None,
+        framework=framework,
+        ecosystem=ecosystem,
+        source="command",
+        evidence={"requested_command": validated},
+    )
+
+
 def _javascript_script_tokens(repository_root: Path) -> tuple[dict, list[str]]:
     package = json.loads((repository_root / "package.json").read_text(encoding="utf-8"))
     return package, _lex_one_command(package["scripts"]["test"])
@@ -1113,11 +1539,43 @@ def _javascript_collection_runner(tokens: list[str]) -> list[str] | None:
     return None
 
 
-def verify_test_environment(workspace, repository_root: Path, test_command: str) -> dict:
+def _unresolved_environment_verification(
+    test_command: str, error: EnvironmentResolutionError
+) -> dict:
+    """Fail-safe verification result when no execution plan can be built."""
+    evidence = error.evidence
+    message = f"environment_unresolved: {error}"
+    return {
+        "ecosystem": "python" if evidence.get("tokens") else "unknown",
+        "repository_manifests": [],
+        "selected_test_command": test_command,
+        "python_interpreter": None,
+        "python_environment": evidence.get("python_environment"),
+        "execution_plan": None,
+        "plan_digest": None,
+        "environment_unresolved": evidence,
+        "ready": False,
+        "checks": [],
+        "failures": [message],
+        "blockers": [message],
+        "limitations": [],
+    }
+
+
+def verify_test_environment(
+    workspace,
+    repository_root: Path,
+    test_command: str,
+    plan: TestExecutionPlan | dict | None = None,
+) -> dict:
     """Independently check runtime, runner, dependency health and test discovery.
 
-    Collection/listing is recorded separately and is never sufficient by itself
-    to set ``ready``. Test functions are not executed by these checks.
+    Every check uses the same ``TestExecutionPlan`` that will run the suite.
+    When no plan is supplied one is resolved once here; if resolution fails the
+    result is a fail-safe ``environment_unresolved`` report and no command is
+    executed. Collection/listing is recorded separately and is never
+    sufficient by itself to set ``ready``. Test functions are not executed by
+    these checks.
     """
     checks: list[dict] = []
     failures: list[str] = []
@@ -1128,9 +1586,31 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
     validated = validate_test_command(test_command, repository_root)
     tokens = shlex.split(validated)
 
+    if isinstance(plan, dict):
+        plan = TestExecutionPlan.from_dict(plan)
+    if plan is None:
+        try:
+            plan = resolve_test_execution_plan(workspace, repository_root, validated)
+        except EnvironmentResolutionError as exc:
+            return _unresolved_environment_verification(validated, exc)
+
+    ecosystem = plan.ecosystem
+    python_interpreter = plan.interpreter
+    python_environment = (plan.evidence or {}).get("python_environment")
+
+    if _python_runner(tokens) and plan.source != "wrapper" and not python_interpreter:
+        return _unresolved_environment_verification(
+            validated,
+            EnvironmentResolutionError(
+                "The execution plan does not contain a Python interpreter for "
+                "a non-wrapped runner.",
+                evidence={"tokens": tokens, "execution_plan": plan.to_dict()},
+            ),
+        )
+
     def check(name: str, argv: list[str]) -> bool:
         passed = _run_verification_check(
-            workspace, checks, name, argv, python_interpreter
+            workspace, checks, name, argv, plan
         )
         if not passed:
             entry = checks[-1]
@@ -1162,13 +1642,16 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
 
     if _python_runner(tokens):
         ecosystem = "python"
-        python_environment = resolve_python_environment(workspace, tokens)
-        python_interpreter = (
-            python_environment["interpreter"] if python_environment else None
-        )
         wrapper, interpreter, runner, framework = _python_verification_parts(
             tokens, python_interpreter
         )
+        framework_missing = (plan.evidence or {}).get("framework_available") is False
+        if framework_missing:
+            failures.append(
+                f"python_test_runner: selected interpreter {python_interpreter!r} "
+                f"cannot import {framework}; refusing to borrow another "
+                "environment's test framework."
+            )
         runtime_ok = check("python_runtime", [*wrapper, interpreter, "--version"])
         runner_version_args = ["-h"] if framework == "unittest" else ["--version"]
         runner_ok = check("python_test_runner", [*wrapper, *runner, *runner_version_args])
@@ -1191,7 +1674,14 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
                 "raise SystemExit(0 if count else 5)"
             )
             collection_ok = check_collection("python_test_collection", [*wrapper, interpreter, "-c", discovery])
-        required_ok = runtime_ok and runner_ok and pip_probe and (pip_check or not pip_available) and collection_ok
+        required_ok = (
+            runtime_ok
+            and runner_ok
+            and pip_probe
+            and (pip_check or not pip_available)
+            and collection_ok
+            and not framework_missing
+        )
     elif tokens[0] in {"npm", "pnpm", "yarn"}:
         ecosystem = "javascript"
         manager = tokens[0]
@@ -1273,6 +1763,9 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
         "selected_test_command": validated,
         "python_interpreter": python_interpreter,
         "python_environment": python_environment,
+        "execution_plan": plan.to_dict(),
+        "plan_digest": plan.digest,
+        "plan_source": plan.source,
         "ready": required_ok,
         "checks": checks,
         "failures": failures,
@@ -1297,6 +1790,8 @@ def run_environment_recovery(
     is checked both before and after each agent turn.
     """
     attempts: list[dict] = []
+    plan_changes: list[dict] = []
+    current_plan_digest = verification.get("plan_digest")
     limit = max(0, min(int(max_attempts), 2))
     terminal_markers = re.compile(
         r"(?:credential|authentication|unauthorized|permission denied|"
@@ -1342,12 +1837,31 @@ Verification failures:
                 attempts.append({"attempt": attempt, "result": "blocked", "reason": "test integrity guard failed after recovery", "integrity": integrity})
                 break
             verification = verify_again()
-            attempts.append({
+            record = {
                 "attempt": attempt,
                 "result": "ready" if verification.get("ready") else "still_blocked",
                 "failures": verification.get("failures", []),
                 "integrity": integrity,
-            })
+            }
+            new_plan_digest = verification.get("plan_digest")
+            if current_plan_digest or new_plan_digest:
+                changed = current_plan_digest != new_plan_digest
+                record.update({
+                    "plan_changed": changed,
+                    "previous_plan_digest": current_plan_digest,
+                    "plan_digest": new_plan_digest,
+                    "plan_source": verification.get("plan_source"),
+                })
+                if changed:
+                    record["execution_plan"] = verification.get("execution_plan")
+                    plan_changes.append({
+                        "attempt": attempt,
+                        "previous_plan_digest": current_plan_digest,
+                        "plan_digest": new_plan_digest,
+                        "plan_source": verification.get("plan_source"),
+                    })
+                current_plan_digest = new_plan_digest
+            attempts.append(record)
             if verification.get("ready"):
                 break
             if attempt < limit:
@@ -1360,6 +1874,7 @@ Verification failures:
             })
             break
     verification["recovery_attempts"] = attempts
+    verification["plan_changes"] = plan_changes
     return verification, attempts
 
 
@@ -1408,65 +1923,73 @@ def _venv_root_for_interpreter(interpreter: str | None) -> str | None:
     return root
 
 
-def sandbox_test_command(command: str, python_interpreter: str | None = None) -> str:
-    """Run tests with only explicitly approved, non-secret environment variables.
-
-    When the selected environment's interpreter is known, bare pytest runners
-    are rewritten to ``<interpreter> -m pytest`` and the sanitized environment
-    is pointed at that virtual environment (``VIRTUAL_ENV`` plus its ``bin``
-    directory first on ``PATH``) so the run works under ``env -i`` without a
-    pre-activated shell. Wrapped runners (uv/poetry/pipenv) already resolve
-    their own environment and are passed through unchanged. No secret values
-    are ever forwarded.
-    """
-    argv = shlex.split(command)
-    if (
-        argv
-        and argv[0] not in {"uv", "poetry", "pipenv"}
-        and _python_runner(argv)
-    ):
-        wrapper, _interpreter, runner, _framework = _python_verification_parts(
-            argv, python_interpreter
-        )
-        argv = [*wrapper, *runner]
-
-    defaults = {
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/tmp",
-        "LANG": "C.UTF-8",
-        "SHELL": "/bin/sh",
-    }
+def _render_plan_environment(plan: TestExecutionPlan) -> list[str]:
+    """Render ``env -i`` assignments from a plan without ever leaking secrets."""
     environment_args = ["env", "-i"]
-    # uv/poetry/pipenv activate their own environment; injecting a venv
-    # discovered elsewhere could misdirect those wrappers (for example by
-    # setting VIRTUAL_ENV to a non-venv system root).
-    #
-    # Prefer the venv the command itself runs: a validated command such as
-    # ``venv/bin/python -m pytest`` selects that environment regardless of any
-    # interpreter resolved by the probe. Falling back to the resolved
-    # interpreter keeps bare runners pointed at the verified environment.
-    venv_root = None
-    if not argv or argv[0] not in {"uv", "poetry", "pipenv"}:
-        if argv:
-            venv_root = _venv_root_for_interpreter(argv[0])
-        if venv_root is None:
-            venv_root = _venv_root_for_interpreter(python_interpreter)
+    path_value = plan.env.get(
+        "PATH", ":".join([*_SANDBOX_USER_BIN, SANDBOX_PATH_DEFAULT])
+    )
+    if _UNSAFE_ENV_VALUE_RE.search(path_value) or _has_control_characters(path_value):
+        raise ValueError("execution plan contains an unsafe PATH value")
 
-    for name in sorted(SANDBOX_ENV_ALLOWLIST):
-        if name == "PATH" and venv_root:
-            path_default = defaults["PATH"]
-            environment_args.append(
-                f'PATH="{venv_root}/bin:${{PATH:-{path_default}}}"'
-            )
-        elif name == "VIRTUAL_ENV" and venv_root:
-            environment_args.append(f'VIRTUAL_ENV="{venv_root}"')
-        else:
-            default = defaults.get(name, "")
-            environment_args.append(
-                f'{name}="${{{name}:-{default}}}"'
-            )
+    if plan.venv_root:
+        if _UNSAFE_ENV_VALUE_RE.search(plan.venv_root) or _has_control_characters(
+            plan.venv_root
+        ):
+            raise ValueError("execution plan contains an unsafe virtual environment root")
+        prefix = plan.venv_root + "/bin:"
+        inherited = path_value[len(prefix):] if path_value.startswith(prefix) else path_value
+        environment_args.append(f'PATH="{plan.venv_root}/bin:${{PATH:-{inherited}}}"')
+    else:
+        environment_args.append(f'PATH="${{PATH:-{path_value}}}"')
 
-    return "cd /workspace && " + " ".join(environment_args) + " " + shlex.join(argv)
+    for name in sorted(plan.env):
+        if name == "PATH":
+            continue
+        value = plan.env[name]
+        if (
+            not _ENV_NAME_RE.fullmatch(name)
+            or _UNSAFE_ENV_VALUE_RE.search(value)
+            or _has_control_characters(value)
+        ):
+            raise ValueError(f"execution plan contains an unsafe value for {name}")
+        environment_args.append(f'{name}="{value}"')
+    return environment_args
+
+
+def sandbox_test_command(
+    plan: TestExecutionPlan | str,
+    python_interpreter: str | None = None,
+    argv: list[str] | None = None,
+) -> str:
+    """Render one sandbox command from a mandatory execution plan.
+
+    ``plan`` is the single source of truth for the interpreter, virtual
+    environment, and sanitized environment. A raw string is accepted for
+    backwards compatibility only when it resolves statically (an explicit
+    interpreter or a workspace venv path); a bare Python runner without a
+    resolved interpreter raises ``EnvironmentResolutionError`` instead of
+    being executed against an unknown environment.
+
+    ``argv`` overrides only the command arguments (for verification probes);
+    the plan's environment is always used. No secret values are forwarded.
+    """
+    if isinstance(plan, TestExecutionPlan):
+        execution_plan = plan
+    else:
+        execution_plan = test_execution_plan_from_command(plan, python_interpreter)
+
+    command_argv = list(argv) if argv is not None else list(execution_plan.argv)
+    if not command_argv:
+        raise EnvironmentResolutionError("The test execution plan has no argv.")
+
+    environment_args = _render_plan_environment(execution_plan)
+    return (
+        "cd /workspace && "
+        + " ".join(environment_args)
+        + " "
+        + shlex.join(command_argv)
+    )
 
 
 def generated_tests_manifest_from_archive(archive_path: Path) -> dict:
@@ -2356,11 +2879,35 @@ def _read_repair_diagnosis(workspace, attempt: int, output: str) -> dict:
 def run_repair_loop(
     workspace,
     conversation,
-    test_command: str,
+    test_command: "str | TestExecutionPlan",
     max_repairs: int,
     generated_tests_guard=None,
 ):
-    """Run full-suite attempts; repair only evidence-backed app bugs/regressions."""
+    """Run full-suite attempts from one execution plan.
+
+    Production passes a ``TestExecutionPlan``. Every attempt then renders the
+    suite through ``sandbox_test_command`` using the same interpreter and
+    environment, so a repair cannot silently change how the suite is executed.
+    A raw string remains accepted for legacy callers/tests only.
+    """
+    if isinstance(test_command, TestExecutionPlan):
+        execution_plan = test_command
+        test_command = sandbox_test_command(execution_plan)
+        plan_metadata = {
+            "plan_digest": execution_plan.digest,
+            "execution_plan": execution_plan.to_dict(),
+        }
+    else:
+        execution_plan = None
+        test_command = str(test_command)
+        plan_metadata = {}
+        legacy_tokens = shlex.split(test_command)
+        if legacy_tokens and _python_runner(legacy_tokens):
+            raise EnvironmentResolutionError(
+                "Python suite execution requires a TestExecutionPlan; a raw "
+                "command string has no verified interpreter.",
+                evidence={"command": test_command},
+            )
     max_repairs = max(0, min(int(max_repairs), 3))
     attempts = []
     final_result = None
@@ -2373,6 +2920,7 @@ def run_repair_loop(
             attempts.append({
                 "attempt": attempt + 1,
                 "command": test_command,
+                **plan_metadata,
                 "exit_code": None,
                 "output": "",
                 "test_integrity": integrity,
@@ -2394,6 +2942,7 @@ def run_repair_loop(
             attempts.append({
                 "attempt": attempt + 1,
                 "command": test_command,
+                **plan_metadata,
                 "exit_code": None,
                 "output": "",
                 "execution_error": type(exc).__name__,
@@ -2406,6 +2955,7 @@ def run_repair_loop(
         attempts.append({
             "attempt": attempt + 1,
             "command": test_command,
+            **plan_metadata,
             "exit_code": result.exit_code,
             "output": output[-12000:],
         })

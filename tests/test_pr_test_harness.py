@@ -8,6 +8,8 @@ import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".github/scripts"))
 
 from pr_test_harness import (
@@ -661,7 +663,9 @@ def test_failure_artifacts_include_test_results_and_repair_history(tmp_path):
 def test_sandbox_test_command_starts_with_clean_environment():
     from pr_test_harness import sandbox_test_command
 
-    command = sandbox_test_command("pytest -q")
+    command = sandbox_test_command(
+        "pytest -q", python_interpreter="/workspace/.venv/bin/python"
+    )
 
     assert "env -i" in command
     assert command.startswith("cd /workspace && env -i")
@@ -671,7 +675,9 @@ def test_sandbox_test_command_starts_with_clean_environment():
 def test_sandbox_test_command_does_not_forward_api_credentials():
     from pr_test_harness import sandbox_test_command
 
-    command = sandbox_test_command("pytest")
+    command = sandbox_test_command(
+        "pytest", python_interpreter="/workspace/.venv/bin/python"
+    )
 
     forbidden = [
         "OPENAI_API_KEY",
@@ -762,11 +768,10 @@ def test_sandbox_test_command_venv_environment_does_not_expose_secrets():
 
 
 def test_sandbox_test_command_refuses_to_inject_unsafe_interpreter_paths():
-    command = sandbox_test_command("pytest", python_interpreter='/tmp/ev"il/bin/python')
+    from pr_test_harness import EnvironmentResolutionError
 
-    assert 'VIRTUAL_ENV="/tmp' not in command
-    assert 'PATH="/tmp' not in command
-    assert "-m pytest" in command
+    with pytest.raises(EnvironmentResolutionError):
+        sandbox_test_command("pytest", python_interpreter='/tmp/ev"il/bin/python')
 
 
 class _EnvironmentWorkspace:
@@ -1371,8 +1376,12 @@ def test_sandbox_test_command_maps_venv_pytest_entry_point_to_interpreter(tmp_pa
     interpreter_path = root / ".venv" / "bin" / "python"
     _write_logging_interpreter(interpreter_path, log)
 
-    command = sandbox_test_command(".venv/bin/pytest -q").replace(
-        "cd /workspace", f"cd {root}", 1
+    plan_command = sandbox_test_command(".venv/bin/pytest -q")
+    assert ".venv/bin/python -m pytest -q" in plan_command
+    # The plan pins the sandbox-absolute interpreter. Rewrite both the working
+    # directory and that path so the same rendering can execute locally.
+    command = plan_command.replace("cd /workspace", f"cd {root}", 1).replace(
+        "/workspace/.venv", f"{root}/.venv"
     )
     completed = subprocess.run(
         command,
