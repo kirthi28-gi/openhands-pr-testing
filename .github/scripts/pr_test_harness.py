@@ -314,8 +314,12 @@ def _venv_runner_kind(token: str) -> str | None:
     parts = PurePosixPath(token).parts
     if len(parts) < 3 or ".." in parts or parts[-2] != "bin":
         return None
-    if token.startswith("/") and parts[0] != "workspace":
-        return None
+    if token.startswith("/"):
+        # PurePosixPath keeps the root as its first component, so workspace
+        # absolute paths are ('/', 'workspace', ...). Anything else is outside
+        # the sandbox workspace and must not be treated as a project runner.
+        if parts[:2] != ("/", "workspace"):
+            return None
     if parts[-1] == "pytest":
         return "pytest"
     if re.fullmatch(r"python(?:3(?:\.\d+)?)?", parts[-1]):

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".github/scripts"))
 
 from pr_test_harness import (
     _python_interpreter_probe_command,
+    _venv_runner_kind,
     ensure_failure_artifacts,
     ensure_generated_tests_unchanged,
     ensure_repository_tests_unchanged,
@@ -711,6 +712,14 @@ def test_sandbox_test_command_maps_venv_pytest_path_to_sibling_interpreter():
     assert 'VIRTUAL_ENV="/workspace/.venv"' in command
 
 
+def test_sandbox_test_command_maps_absolute_workspace_pytest_to_sibling():
+    command = sandbox_test_command("/workspace/custom/bin/pytest -q")
+
+    assert "/workspace/custom/bin/python -m pytest -q" in command
+    assert 'VIRTUAL_ENV="/workspace/custom"' in command
+    assert 'PATH="/workspace/custom/bin:${PATH:-' in command
+
+
 def test_sandbox_test_command_points_environment_at_the_command_venv():
     """A command that names its own venv must not inherit a different one."""
     command = sandbox_test_command(
@@ -991,6 +1000,62 @@ def test_validate_test_command_accepts_venv_paths_and_rejects_escapes(tmp_path):
         except ValueError:
             continue
         raise AssertionError(f"unsafe runner path accepted: {command}")
+
+
+def test_venv_runner_kind_accepts_absolute_workspace_runners():
+    """Regression: PurePosixPath keeps '/' first, so '/workspace/...' was missed."""
+    assert _venv_runner_kind("/workspace/custom/bin/pytest") == "pytest"
+    assert _venv_runner_kind("/workspace/custom/bin/python") == "python"
+    assert _venv_runner_kind("/workspace/custom/bin/python3.12") == "python"
+    assert _venv_runner_kind("qa-env/bin/python") == "python"
+    assert _venv_runner_kind("qa-env/bin/pytest") == "pytest"
+
+    for token in (
+        "/etc/bin/pytest",
+        "/usr/bin/python3",
+        "/workspace/../bin/python",
+        "/workspace/custom/bin/nosetests",
+    ):
+        assert _venv_runner_kind(token) is None, token
+
+
+def test_validate_test_command_accepts_absolute_workspace_runners(tmp_path):
+    root = _python_repo(tmp_path)
+
+    assert (
+        validate_test_command("/workspace/custom/bin/pytest -q", root)
+        == "/workspace/custom/bin/pytest -q"
+    )
+    assert (
+        validate_test_command("/workspace/custom/bin/python -m pytest -q", root)
+        == "/workspace/custom/bin/python -m pytest -q"
+    )
+
+
+def test_validate_test_command_accepts_nested_venv_python_runner(tmp_path):
+    # The fixture must supply repository evidence (tests/test_example.py);
+    # validation still requires that Python runners be evidenced by the repo.
+    root = _python_repo(tmp_path)
+
+    assert (
+        validate_test_command("qa-env/bin/python -m pytest -q", root)
+        == "qa-env/bin/python -m pytest -q"
+    )
+
+
+def test_validate_test_command_still_requires_python_evidence(tmp_path):
+    root = tmp_path / "repo"
+    (root / "qa-env" / "bin").mkdir(parents=True)
+
+    for command in (
+        "qa-env/bin/python -m pytest -q",
+        "/workspace/custom/bin/pytest -q",
+    ):
+        try:
+            validate_test_command(command, root)
+        except ValueError:
+            continue
+        raise AssertionError(f"runner accepted without repository evidence: {command}")
 
 
 def _write_logging_interpreter(path, log_path):
