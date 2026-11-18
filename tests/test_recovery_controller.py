@@ -263,14 +263,12 @@ def test_orchestration_controller_retries_staged_import_only_in_fresh_docker(tmp
         return workspace
 
     assert recovery_controller.run_controller(trusted, env, workspace_factory) == 1
-    assert len(runs) == 2
+    assert len(runs) == 1
     assert runs[0] == scripts / "generate_tests.py"
-    assert runs[1].name == "generate_tests.py"
-    assert runs[1] != runs[0]
     assert (scripts / "generate_tests.py").read_text() == "# trusted baseline\n"
     report = (automation / "generated-tests/orchestration-recovery.json").read_text()
-    assert '"result": "retry_failed"' in report
-    assert '"pipeline_resumed": true' in report
+    assert '"result": "sandbox_validation_passed_pending_review"' in report
+    assert '"pipeline_resumed": false' in report
     assert len(workspaces) == 1 and workspaces[0].cleaned
     assert workspaces[0].kwargs["network"] == "bridge"
     assert workspaces[0].kwargs["volumes"] == []
@@ -329,7 +327,7 @@ def test_orchestration_controller_does_not_bypass_validated_test_failure(tmp_pat
     calls = []
     monkeypatch.setattr(
         recovery_controller, "_run_generator",
-        lambda *_, **__: (calls.append(True) or SimpleNamespace(returncode=1, stdout="test failed", stderr="Docker is not available: permission denied")),
+        lambda *_, **__: (calls.append(True) or SimpleNamespace(returncode=1, stdout="test failed", stderr="")),
     )
     monkeypatch.setattr(recovery_controller, "_normal_result_exists", lambda _: True)
     monkeypatch.setattr(recovery_controller, "_recover_staged_script", lambda *args: pytest.fail("must not recover"))
@@ -509,7 +507,7 @@ def test_controller_stops_recovery_on_infrastructure_failure(tmp_path, monkeypat
 
 
 
-def test_controller_retries_recovered_generator_once(tmp_path, monkeypatch):
+def test_controller_validates_recovered_generator_without_host_execution(tmp_path, monkeypatch):
     trusted = tmp_path / "trusted"
     scripts = trusted / ".github/scripts"
     scripts.mkdir(parents=True)
@@ -561,9 +559,23 @@ def test_controller_retries_recovered_generator_once(tmp_path, monkeypatch):
 
     result = recovery_controller.run_controller(trusted, env)
 
-    assert result == 0
-    assert len(runs) == 2
+    assert result == 1
+    assert len(runs) == 1
     assert runs[0] == scripts / "generate_tests.py"
-    assert runs[1].name == "generate_tests.py"
-    assert runs[1] != runs[0]
     assert (scripts / "generate_tests.py").read_text() == original_script
+    report = (automation / "generated-tests/orchestration-recovery.json").read_text()
+    assert '"result": "sandbox_validation_passed_pending_review"' in report
+    assert '"pipeline_resumed": false' in report
+
+
+def test_recovered_runner_rejects_extra_import_from_existing_module():
+    baseline = "import os\n\ndef run():\n    return os.getcwd()\n"
+    unsafe = (
+        "import os\n"
+        "from os import system as run_command\n"
+        "\ndef run():\n"
+        "    return os.getcwd()\n"
+    )
+
+    with pytest.raises(RuntimeError, match="unapproved import"):
+        recovery_controller._validate_recovered_candidate(baseline, unsafe)

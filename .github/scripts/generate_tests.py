@@ -19,6 +19,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from pr_test_harness import (
+    EnvironmentResolutionError,
+    TestExecutionPlan,
     ensure_failure_artifacts,
     capture_generated_tests_snapshot,
     capture_repository_tests_snapshot,
@@ -29,12 +31,14 @@ from pr_test_harness import (
     load_agent_report,
     normalize_unified_git_patch,
     run_repair_loop,
-    run_environment_recovery,
-    sandbox_test_command,
     update_validation_marker,
     validate_test_command,
     verify_test_environment,
 )
+
+from environment_detector import detect_environment
+from failure_classifier import final_status
+from repair_engine import RepairEngine, configured_repair_limits
 
 from pydantic import SecretStr
 
@@ -456,6 +460,9 @@ Do not stop after describing the tests. Create the files.
             attempt_records = []
             validated_command = None
             environment_ready = False
+            # Populated from the sandbox after agent preparation; never from
+            # the host checkout.
+            environment_detection = {}
             environment_verification = {
                 "ecosystem": "unknown",
                 "selected_test_command": None,
@@ -595,6 +602,21 @@ Do not stop after describing the tests. Create the files.
                     environment_verification["failures"].append(message)
                     environment_verification["blockers"].append(message)
 
+                # Re-detect repository state inside the sandbox after the agent
+                # has prepared the environment. Host manifests are never used
+                # for sandbox installation decisions.
+                try:
+                    environment_detection = detect_environment(
+                        repository_root=None, workspace=workspace
+                    )
+                except Exception as exc:
+                    message = (
+                        "Sandbox environment detection failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    environment_verification["failures"].append(message)
+                    environment_verification["blockers"].append(message)
+
                 # The agent-created marker is not evidence. Independently
                 # inspect the repository-native command and sandbox state.
                 try:
@@ -642,24 +664,40 @@ Do not stop after describing the tests. Create the files.
                     and generated_tests_manifest is not None
                     and original_repository_tests_manifest is not None
                 ):
-                    environment_verification, _ = run_environment_recovery(
+                    max_repairs, repair_budget = configured_repair_limits()
+                    repair_engine = RepairEngine(
                         workspace,
-                        conversation,
-                        environment_verification,
+                        repo_path,
+                        environment_detection,
                         lambda: verify_test_environment(
                             workspace, repo_path, validated_command
                         ),
-                        max_attempts=int(os.getenv("MAX_ENVIRONMENT_REPAIR_ATTEMPTS", "2")),
+                        max_attempts=max_repairs,
+                        time_budget_seconds=repair_budget,
                         integrity_guard=generated_tests_guard,
+                        conversation=conversation,
+                        detect_fn=lambda: detect_environment(
+                            repository_root=None, workspace=workspace
+                        ),
+                    )
+                    environment_verification, repair_history = repair_engine.repair(
+                        environment_verification
                     )
                     environment_ready = environment_verification.get("ready", False)
                 if environment_ready:
                     try:
-                        test_command = sandbox_test_command(validated_command)
+                        plan_data = environment_verification.get("execution_plan")
+                        if not plan_data:
+                            raise EnvironmentResolutionError(
+                                "Independent verification reported readiness without "
+                                "an execution plan; refusing to run the suite.",
+                                evidence={"verification": environment_verification},
+                            )
+                        execution_plan = TestExecutionPlan.from_dict(plan_data)
                         test_result, attempt_records = run_repair_loop(
                             workspace,
                             conversation,
-                            test_command,
+                            execution_plan,
                             max_repair_attempts,
                             generated_tests_guard=generated_tests_guard,
                         )
@@ -814,12 +852,29 @@ Do not stop after describing the tests. Create the files.
                 report["blockers"].append(
                     "Runtime/dependency preparation was not verified by the harness."
                 )
+            status_result = final_status(
+                environment_ready,
+                test_result.exit_code,
+                verification=environment_verification,
+                detection=environment_detection,
+                report_category=report.get("final_failure_category"),
+            )
+            overall_status = status_result["status"]
+            failure_category = status_result["failure_category"]
+
             report.update({
                 "pr_number": pr_number,
                 "base_sha": base_sha,
                 "head_sha": head_sha,
                 "sandbox_image": server_image,
                 "harness_attempts": attempt_records,
+                "status": overall_status,
+                "failure_category": failure_category,
+                "environment_detection": environment_detection,
+                "environment_repair_history": environment_verification.get(
+                    "environment_repair_history", []
+                ),
+                "recovery_status": environment_verification.get("recovery_status"),
                 "result": "passed" if test_result.exit_code == 0 else "failed",
                 "harness_result": "passed" if test_result.exit_code == 0 else "failed",
                 "report_valid": report_valid and patch_capture_valid,
@@ -827,6 +882,13 @@ Do not stop after describing the tests. Create the files.
                 "harness_final_exit_code": test_result.exit_code,
                 "environment_ready": environment_ready,
                 "validated_test_command": validated_command,
+                "execution_plan": environment_verification.get("execution_plan"),
+                "plan_digest": environment_verification.get("plan_digest"),
+                "plan_source": environment_verification.get("plan_source"),
+                "environment_unresolved": environment_verification.get(
+                    "environment_unresolved"
+                ),
+                "plan_changes": environment_verification.get("plan_changes", []),
                 "final_failure_category": final_failure_category(
                     report, attempt_records, environment_ready
                 ),
@@ -879,9 +941,19 @@ Do not stop after describing the tests. Create the files.
             test_results_path = output_dir / "openhands-test-results.json"
             test_results_path.write_text(json.dumps({
                 "result": report["result"],
+                "status": overall_status,
+                "failure_category": failure_category,
                 "final_exit_code": test_result.exit_code,
                 "validated_test_command": validated_command,
                 "environment_ready": environment_ready,
+                "environment_detection": environment_detection,
+                "environment_repair_history": environment_verification.get(
+                    "environment_repair_history", []
+                ),
+                "execution_plan": environment_verification.get("execution_plan"),
+                "plan_digest": environment_verification.get("plan_digest"),
+                "plan_source": environment_verification.get("plan_source"),
+                "plan_changes": environment_verification.get("plan_changes", []),
                 "attempts": attempt_records,
                 "final_stdout": test_result.stdout or "",
                 "final_stderr": test_result.stderr or "",
@@ -978,6 +1050,7 @@ Do not stop after describing the tests. Create the files.
                         f"- Base: `{base_sha}`\n"
                         f"- Head: `{head_sha}`\n"
                         f"- Sandbox: `{server_image}`\n"
+                        f"- Overall status: {overall_status}\n"
                         f"- Result: {'PASSED' if test_result.exit_code == 0 else 'FAILED'}\n"
                         f"- Failure category: {report['final_failure_category'] or 'none'}\n"
                         f"- Attempts: {len(attempt_records)}\n\n"
