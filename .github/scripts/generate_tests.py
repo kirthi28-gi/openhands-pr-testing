@@ -19,6 +19,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from pr_test_harness import (
+    EnvironmentResolutionError,
+    TestExecutionPlan,
     ensure_failure_artifacts,
     capture_generated_tests_snapshot,
     capture_repository_tests_snapshot,
@@ -30,7 +32,6 @@ from pr_test_harness import (
     normalize_unified_git_patch,
     run_repair_loop,
     run_environment_recovery,
-    sandbox_test_command,
     update_validation_marker,
     validate_test_command,
     verify_test_environment,
@@ -655,11 +656,18 @@ Do not stop after describing the tests. Create the files.
                     environment_ready = environment_verification.get("ready", False)
                 if environment_ready:
                     try:
-                        test_command = sandbox_test_command(validated_command)
+                        plan_data = environment_verification.get("execution_plan")
+                        if not plan_data:
+                            raise EnvironmentResolutionError(
+                                "Independent verification reported readiness without "
+                                "an execution plan; refusing to run the suite.",
+                                evidence={"verification": environment_verification},
+                            )
+                        execution_plan = TestExecutionPlan.from_dict(plan_data)
                         test_result, attempt_records = run_repair_loop(
                             workspace,
                             conversation,
-                            test_command,
+                            execution_plan,
                             max_repair_attempts,
                             generated_tests_guard=generated_tests_guard,
                         )
@@ -827,6 +835,13 @@ Do not stop after describing the tests. Create the files.
                 "harness_final_exit_code": test_result.exit_code,
                 "environment_ready": environment_ready,
                 "validated_test_command": validated_command,
+                "execution_plan": environment_verification.get("execution_plan"),
+                "plan_digest": environment_verification.get("plan_digest"),
+                "plan_source": environment_verification.get("plan_source"),
+                "environment_unresolved": environment_verification.get(
+                    "environment_unresolved"
+                ),
+                "plan_changes": environment_verification.get("plan_changes", []),
                 "final_failure_category": final_failure_category(
                     report, attempt_records, environment_ready
                 ),
@@ -882,6 +897,10 @@ Do not stop after describing the tests. Create the files.
                 "final_exit_code": test_result.exit_code,
                 "validated_test_command": validated_command,
                 "environment_ready": environment_ready,
+                "execution_plan": environment_verification.get("execution_plan"),
+                "plan_digest": environment_verification.get("plan_digest"),
+                "plan_source": environment_verification.get("plan_source"),
+                "plan_changes": environment_verification.get("plan_changes", []),
                 "attempts": attempt_records,
                 "final_stdout": test_result.stdout or "",
                 "final_stderr": test_result.stderr or "",

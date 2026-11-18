@@ -30,18 +30,15 @@ from pr_test_harness import ensure_failure_artifacts
 
 MAX_RECOVERY_SESSIONS = 1
 RECOVERY_TARGET = Path(".github/scripts/generate_tests.py")
-SAFE_ADDITIONAL_IMPORTS = {"types", "sys", "pathlib"}
+SAFE_ADDITIONAL_IMPORT_NODES = {
+    ast.dump(ast.parse(statement).body[0], include_attributes=False)
+    for statement in (
+        "from types import SimpleNamespace",
+        "import sys",
+        "from pathlib import Path",
+    )
+}
 MAX_RECOVERED_SCRIPT_BYTES = 2 * 1024 * 1024
-
-
-def _module_imports(tree: ast.Module) -> set[str]:
-    roots: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            roots.add(node.module.split(".", 1)[0])
-    return roots
 
 
 def _without_imports_or_safe_path_setup(tree: ast.Module) -> ast.Module:
@@ -63,16 +60,6 @@ def _validate_recovered_candidate(baseline: str, candidate: str) -> None:
     """Permit import/path fixes while keeping all trusted runner logic fixed."""
     baseline_tree = ast.parse(baseline)
     candidate_tree = ast.parse(candidate)
-    baseline_imports = _module_imports(baseline_tree)
-    candidate_imports = _module_imports(candidate_tree)
-    if not baseline_imports.issubset(candidate_imports):
-        raise RuntimeError("Recovered runner removed trusted imports")
-    unexpected_imports = candidate_imports - baseline_imports - SAFE_ADDITIONAL_IMPORTS
-    if unexpected_imports:
-        raise RuntimeError(
-            "Recovered runner added unapproved imports: "
-            + ", ".join(sorted(unexpected_imports))
-        )
     baseline_import_nodes = [
         ast.dump(node, include_attributes=False) for node in baseline_tree.body
         if isinstance(node, (ast.Import, ast.ImportFrom))
@@ -82,7 +69,13 @@ def _validate_recovered_candidate(baseline: str, candidate: str) -> None:
         if isinstance(node, (ast.Import, ast.ImportFrom))
     ]
     if not all(candidate_import_nodes.count(node) >= baseline_import_nodes.count(node) for node in set(baseline_import_nodes)):
-        raise RuntimeError("Recovered runner changed existing trusted imports")
+        raise RuntimeError("Recovered runner removed trusted imports or changed existing trusted imports")
+    remaining = baseline_import_nodes.copy()
+    for node in candidate_import_nodes:
+        if node in remaining:
+            remaining.remove(node)
+        elif node not in SAFE_ADDITIONAL_IMPORT_NODES:
+            raise RuntimeError("Recovered runner added unapproved imports (import statements)")
     if ast.dump(_without_imports_or_safe_path_setup(baseline_tree), include_attributes=False) != ast.dump(
         _without_imports_or_safe_path_setup(candidate_tree), include_attributes=False
     ):
@@ -444,13 +437,6 @@ def run_controller(
                 env,
                 workspace_factory=workspace_factory,
             )
-            recovered_run = None
-            if sandbox_retry["exit_code"] == 0:
-                recovered_run = _run_generator(
-                    staged_script,
-                    _trusted_runner_environment(env),
-                    timeout=30 * 60,
-                )
             proposed_patch = "".join(difflib.unified_diff(
                 (source_scripts / "generate_tests.py").read_text(encoding="utf-8").splitlines(keepends=True),
                 staged_script.read_text(encoding="utf-8").splitlines(keepends=True),
@@ -458,23 +444,17 @@ def run_controller(
                 tofile="sandbox-recovered/generate_tests.py",
             ))
             output_dir.mkdir(parents=True, exist_ok=True)
-            retry_succeeded = (
-                recovered_run is not None and recovered_run.returncode == 0
-            )
-            retry_output = ""
-            if recovered_run is not None:
-                retry_output = (recovered_run.stdout or "") + "\\n" + (recovered_run.stderr or "")
+            sandbox_validation_passed = sandbox_retry["exit_code"] == 0
 
-            if not retry_succeeded:
-                try:
-                    ensure_failure_artifacts(output_dir, "OrchestrationRecoveryIncomplete")
-                except Exception as exc:
-                    sandbox_retry["artifact_error"] = type(exc).__name__
+            try:
+                ensure_failure_artifacts(output_dir, "OrchestrationRecoveryIncomplete")
+            except Exception as exc:
+                sandbox_retry["artifact_error"] = type(exc).__name__
 
             with (output_dir / "orchestration-recovery.json").open("w", encoding="utf-8") as report:
                 json.dump({
-                    "stage": "recovered_generator_retry",
-                    "result": "retry_passed" if retry_succeeded else "retry_failed",
+                    "stage": "sandboxed_recovered_runner_validation",
+                    "result": "sandbox_validation_passed_pending_review" if sandbox_validation_passed else "sandbox_validation_failed",
                     "recovery_sessions": MAX_RECOVERY_SESSIONS,
                     "failure_classification": failure_classification,
                     "initial_output": _redact_secrets(initial_output, env)[-60000:],
@@ -482,14 +462,14 @@ def run_controller(
                         **sandbox_retry,
                         "output": _redact_secrets(sandbox_retry["output"], env)[-24000:],
                     },
-                    "retry_exit_code": recovered_run.returncode if recovered_run else None,
-                    "retry_output": _redact_secrets(retry_output, env)[-60000:],
+                    "retry_exit_code": None,
+                    "retry_output": "",
                     "proposed_patch": _redact_secrets(proposed_patch, env),
-                    "pipeline_resumed": recovered_run is not None,
+                    "pipeline_resumed": False,
                     "trusted_checkout_modified": False,
                 }, report, indent=2)
             _redact_artifact_reports(output_dir, env)
-            return recovered_run.returncode if recovered_run is not None else 1
+            return 1
         except Exception:
             details = _redact_secrets(traceback.format_exc(), env)
             _write_controller_failure(output_dir, "independent_recovery", initial_output + "\n" + details, env)
