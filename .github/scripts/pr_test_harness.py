@@ -304,14 +304,42 @@ def _lex_one_command(command: str) -> list[str]:
     return tokens
 
 
+def _venv_runner_kind(token: str) -> str | None:
+    """Classify a venv interpreter or pytest path token without hardcoding a location.
+
+    Accepts sandbox-relative paths such as ``venv/bin/python`` and absolute
+    paths inside the sandbox workspace (``/workspace/...``) only, and rejects
+    path traversal.
+    """
+    parts = PurePosixPath(token).parts
+    if len(parts) < 3 or ".." in parts or parts[-2] != "bin":
+        return None
+    if token.startswith("/") and parts[0] != "workspace":
+        return None
+    if parts[-1] == "pytest":
+        return "pytest"
+    if re.fullmatch(r"python(?:3(?:\.\d+)?)?", parts[-1]):
+        return "python"
+    return None
+
+
+def _interpreter_sibling_python(token: str) -> str:
+    """Map a venv pytest path (``venv/bin/pytest``) to its environment interpreter."""
+    parts = PurePosixPath(token).parts
+    return str(PurePosixPath(*parts[:-1], "python"))
+
+
 def _python_runner(tokens: list[str]) -> bool:
     if not tokens:
         return False
-    if tokens[0] in {"pytest", ".venv/bin/pytest", "/workspace/.venv/bin/pytest"}:
+    kind = _venv_runner_kind(tokens[0])
+    if tokens[0] == "pytest" or kind == "pytest":
         return _full_pytest_arguments(tokens[1:])
-    if tokens[0] in {"python", "python3", ".venv/bin/python", "/workspace/.venv/bin/python"}:
-        return _python_module_runner(tokens[1:])
-    if re.fullmatch(r"python3\.\d+", tokens[0]):
+    if (
+        tokens[0] in {"python", "python3"}
+        or kind == "python"
+        or re.fullmatch(r"python3\.\d+", tokens[0])
+    ):
         return _python_module_runner(tokens[1:])
     if tokens[0] == "uv":
         if len(tokens) < 4 or tokens[1] != "run":
@@ -629,10 +657,13 @@ def validate_test_command(command: str, repository_root: Path) -> str:
     raise ValueError("test command is not a supported, repository-verified runner")
 
 
-def _run_verification_check(workspace, checks: list[dict], name: str, argv: list[str]) -> bool:
-    command = shlex.join(argv)
+def _run_verification_check(
+    workspace, checks: list[dict], name: str, argv: list[str],
+    python_interpreter: str | None = None,
+) -> bool:
+    command = sandbox_test_command(shlex.join(argv), python_interpreter=python_interpreter)
     try:
-        result = workspace.execute_command(sandbox_test_command(command), timeout=600)
+        result = workspace.execute_command(command, timeout=600)
         stdout = result.stdout or ""
         stderr = result.stderr or ""
         output = _redact_sensitive_values(
@@ -655,8 +686,21 @@ def _run_verification_check(workspace, checks: list[dict], name: str, argv: list
     return passed
 
 
-def _python_verification_parts(tokens: list[str]) -> tuple[list[str], str, list[str], str]:
-    """Return wrapper, interpreter, runner argv, and test framework."""
+def _python_verification_parts(
+    tokens: list[str], interpreter: str | None = None
+) -> tuple[list[str], str, list[str], str]:
+    """Return wrapper, environment interpreter, runner argv, and test framework.
+
+    Bare (non-wrapped) runners are rewritten to invoke the framework through
+    the selected environment's own interpreter (``<interpreter> -m <framework>``)
+    so the sanitized verifier environment never depends on the virtual
+    environment's bin directory being on ``PATH``.
+
+    Wrapped runners (uv, poetry, pipenv) select and activate their own
+    environment, which may live outside the workspace. Their validated runner
+    is therefore kept intact so an interpreter resolved elsewhere cannot
+    bypass the wrapper's environment; the wrapper resolves its own ``python``.
+    """
     wrapper: list[str] = []
     if tokens[0] == "uv":
         wrapper = tokens[:4]
@@ -667,19 +711,163 @@ def _python_verification_parts(tokens: list[str]) -> tuple[list[str], str, list[
         wrapper = tokens[:2]
         runner = tokens[2:]
     else:
-        runner = tokens
+        runner = list(tokens)
 
-    if runner[0] in {"pytest", ".venv/bin/pytest", "/workspace/.venv/bin/pytest"}:
-        interpreter = {
-            ".venv/bin/pytest": ".venv/bin/python",
-            "/workspace/.venv/bin/pytest": "/workspace/.venv/bin/python",
-        }.get(runner[0], "python")
-        return wrapper, interpreter, [runner[0]], "pytest"
-    if runner[0] in {"python", "python3", ".venv/bin/python", "/workspace/.venv/bin/python"} or re.fullmatch(r"python3\.\d+", runner[0]):
-        interpreter = runner[0]
+    if wrapper:
+        kind = _venv_runner_kind(runner[0]) if runner else None
+        if runner[0] == "pytest" or kind == "pytest":
+            env_interpreter = (
+                _interpreter_sibling_python(runner[0]) if kind == "pytest" else "python"
+            )
+            return wrapper, env_interpreter, list(runner), "pytest"
+        env_interpreter = runner[0]
         framework = runner[2]
-        return wrapper, interpreter, [interpreter, "-m", framework], framework
+        return wrapper, env_interpreter, list(runner), framework
+
+    kind = _venv_runner_kind(runner[0]) if runner else None
+    if runner[0] == "pytest" or kind == "pytest":
+        if kind == "pytest":
+            env_interpreter = _interpreter_sibling_python(runner[0])
+            return (
+                wrapper,
+                env_interpreter,
+                [env_interpreter, "-m", "pytest", *runner[1:]],
+                "pytest",
+            )
+        if interpreter:
+            return (
+                wrapper,
+                interpreter,
+                [interpreter, "-m", "pytest", *runner[1:]],
+                "pytest",
+            )
+        # No environment interpreter was resolved; keep the PATH-resolved
+        # entry point for system-level installations.
+        return wrapper, "python", list(runner), "pytest"
+    if (
+        runner[0] in {"python", "python3"}
+        or kind == "python"
+        or (interpreter is not None and runner[0] == interpreter)
+        or re.fullmatch(r"python3\.\d+", runner[0])
+    ):
+        if kind == "python":
+            env_interpreter = runner[0]
+        elif interpreter is not None and runner[0] in {"python", "python3"}:
+            env_interpreter = interpreter
+        else:
+            env_interpreter = runner[0]
+        framework = runner[2]
+        return (
+            wrapper,
+            env_interpreter,
+            [env_interpreter, "-m", framework, *runner[3:]],
+            framework,
+        )
     raise ValueError("Could not derive the Python runtime and test runner from the validated command")
+
+
+_PYTHON_INTERPRETER_PROBE_SCRIPT = (
+    "import json, os, shutil, subprocess\n"
+    "candidates = CANDIDATES_JSON\n"
+    "virtual_env = os.environ.get('VIRTUAL_ENV')\n"
+    "if virtual_env:\n"
+    "    candidates.append(os.path.join(virtual_env, 'bin', 'python'))\n"
+    "for dirname in ('.venv', 'venv', '.env', 'env'):\n"
+    "    candidates.append(os.path.join(dirname, 'bin', 'python'))\n"
+    "candidates.append('python3')\n"
+    "report = {'pytest_interpreter': None, 'environment_interpreter': None}\n"
+    "seen = set()\n"
+    "for raw in candidates:\n"
+    "    if not raw or raw in seen:\n"
+    "        continue\n"
+    "    seen.add(raw)\n"
+    "    if os.path.sep in raw:\n"
+    "        path = os.path.abspath(raw)\n"
+    "        if not (os.path.isfile(path) and os.access(path, os.X_OK)):\n"
+    "            continue\n"
+    "    else:\n"
+    "        path = shutil.which(raw)\n"
+    "        if not path:\n"
+    "            continue\n"
+    "    if report['environment_interpreter'] is None:\n"
+    "        report['environment_interpreter'] = path\n"
+    "    try:\n"
+    "        probe = subprocess.run(\n"
+    "            [path, '-c', 'import pytest'], capture_output=True, timeout=10,\n"
+    "        )\n"
+    "    except Exception:\n"
+    "        continue\n"
+    "    if probe.returncode == 0:\n"
+    "        report['pytest_interpreter'] = path\n"
+    "        break\n"
+    "print(json.dumps(report))\n"
+)
+
+
+def _python_interpreter_probe_command(
+    extra_candidates: list[str], executable: str = "python3"
+) -> str:
+    """Build a read-only sandbox probe that locates the project Python environment.
+
+    The probe only reports interpreter paths; it never prints environment
+    values, so no secrets can leak through its output.
+    """
+    script = _PYTHON_INTERPRETER_PROBE_SCRIPT.replace(
+        "CANDIDATES_JSON",
+        json.dumps([str(item) for item in extra_candidates]),
+    )
+    return (
+        f"cd /workspace && {executable} - <<'OPENHANDS_PYTHON_ENV_PROBE'\n"
+        + script
+        + "OPENHANDS_PYTHON_ENV_PROBE"
+    )
+
+
+def resolve_python_interpreter(workspace, tokens: list[str] | None = None) -> str | None:
+    """Locate the Python interpreter of the project's selected test environment.
+
+    Evidence-led resolution: interpreters referenced by the validated command,
+    the sandbox ``VIRTUAL_ENV``, common environment directory names at the
+    workspace root, and finally ``python3``. An interpreter where pytest
+    imports is preferred. No environment location is hardcoded, so projects
+    using any virtual-environment directory keep working. Returns an absolute
+    interpreter path, or None when no environment could be identified.
+    """
+    extra_candidates: list[str] = []
+    if tokens:
+        kind = _venv_runner_kind(tokens[0])
+        if kind == "python":
+            extra_candidates.append(tokens[0])
+        elif kind == "pytest":
+            extra_candidates.append(_interpreter_sibling_python(tokens[0]))
+    for executable in ("python3", "python"):
+        try:
+            result = workspace.execute_command(
+                _python_interpreter_probe_command(extra_candidates, executable),
+                timeout=120,
+            )
+        except Exception:
+            continue
+        output = (result.stdout or "").strip()
+        if not output:
+            continue
+        try:
+            report = json.loads(output.splitlines()[-1])
+        except (ValueError, IndexError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        for key in ("pytest_interpreter", "environment_interpreter"):
+            value = report.get(key)
+            if (
+                isinstance(value, str)
+                and value.startswith("/")
+                and ".." not in PurePosixPath(value).parts
+                and re.search(r'["`$\\]', value) is None
+                and not _has_control_characters(value)
+            ):
+                return value
+    return None
 
 
 def _javascript_script_tokens(repository_root: Path) -> tuple[dict, list[str]]:
@@ -735,11 +923,14 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
     failures: list[str] = []
     limitations: list[str] = []
     ecosystem = "unknown"
+    python_interpreter: str | None = None
     validated = validate_test_command(test_command, repository_root)
     tokens = shlex.split(validated)
 
     def check(name: str, argv: list[str]) -> bool:
-        passed = _run_verification_check(workspace, checks, name, argv)
+        passed = _run_verification_check(
+            workspace, checks, name, argv, python_interpreter
+        )
         if not passed:
             entry = checks[-1]
             failures.append(
@@ -770,7 +961,10 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
 
     if _python_runner(tokens):
         ecosystem = "python"
-        wrapper, interpreter, runner, framework = _python_verification_parts(tokens)
+        python_interpreter = resolve_python_interpreter(workspace, tokens)
+        wrapper, interpreter, runner, framework = _python_verification_parts(
+            tokens, python_interpreter
+        )
         runtime_ok = check("python_runtime", [*wrapper, interpreter, "--version"])
         runner_version_args = ["-h"] if framework == "unittest" else ["--version"]
         runner_ok = check("python_test_runner", [*wrapper, *runner, *runner_version_args])
@@ -873,6 +1067,7 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
         "ecosystem": ecosystem,
         "repository_manifests": manifests,
         "selected_test_command": validated,
+        "python_interpreter": python_interpreter,
         "ready": required_ok,
         "checks": checks,
         "failures": failures,
@@ -971,9 +1166,64 @@ def _redact_sensitive_values(text: str) -> str:
     return text
 
 
-def sandbox_test_command(command: str) -> str:
-    """Run tests with only explicitly approved, non-secret environment variables."""
+_SYSTEM_INTERPRETER_ROOTS = {
+    "/", "/usr", "/usr/local", "/bin", "/sbin", "/lib", "/lib64", "/etc",
+}
+
+
+def _has_control_characters(value: str) -> bool:
+    """Reject newlines and other control characters from embedded paths."""
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
+
+def _venv_root_for_interpreter(interpreter: str | None) -> str | None:
+    """Derive a virtual-environment root from an interpreter path, safely.
+
+    Returns None for bare/system interpreter names, system interpreter roots,
+    and paths containing characters that could break out of the generated
+    environment assignment.
+    """
+    if not interpreter:
+        return None
+    parts = PurePosixPath(interpreter).parts
+    if (
+        len(parts) < 3
+        or ".." in parts
+        or parts[-2] != "bin"
+        or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", parts[-1])
+    ):
+        return None
+    root = str(PurePosixPath(*parts[:-2]))
+    if not root or re.search(r'["`$\\]', root) or _has_control_characters(root):
+        return None
+    if not root.startswith("/"):
+        root = "/workspace/" + root
+    if root in _SYSTEM_INTERPRETER_ROOTS:
+        return None
+    return root
+
+
+def sandbox_test_command(command: str, python_interpreter: str | None = None) -> str:
+    """Run tests with only explicitly approved, non-secret environment variables.
+
+    When the selected environment's interpreter is known, bare pytest runners
+    are rewritten to ``<interpreter> -m pytest`` and the sanitized environment
+    is pointed at that virtual environment (``VIRTUAL_ENV`` plus its ``bin``
+    directory first on ``PATH``) so the run works under ``env -i`` without a
+    pre-activated shell. Wrapped runners (uv/poetry/pipenv) already resolve
+    their own environment and are passed through unchanged. No secret values
+    are ever forwarded.
+    """
     argv = shlex.split(command)
+    if (
+        argv
+        and argv[0] not in {"uv", "poetry", "pipenv"}
+        and _python_runner(argv)
+    ):
+        wrapper, _interpreter, runner, _framework = _python_verification_parts(
+            argv, python_interpreter
+        )
+        argv = [*wrapper, *runner]
 
     defaults = {
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -982,12 +1232,34 @@ def sandbox_test_command(command: str) -> str:
         "SHELL": "/bin/sh",
     }
     environment_args = ["env", "-i"]
+    # uv/poetry/pipenv activate their own environment; injecting a venv
+    # discovered elsewhere could misdirect those wrappers (for example by
+    # setting VIRTUAL_ENV to a non-venv system root).
+    #
+    # Prefer the venv the command itself runs: a validated command such as
+    # ``venv/bin/python -m pytest`` selects that environment regardless of any
+    # interpreter resolved by the probe. Falling back to the resolved
+    # interpreter keeps bare runners pointed at the verified environment.
+    venv_root = None
+    if not argv or argv[0] not in {"uv", "poetry", "pipenv"}:
+        if argv:
+            venv_root = _venv_root_for_interpreter(argv[0])
+        if venv_root is None:
+            venv_root = _venv_root_for_interpreter(python_interpreter)
 
     for name in sorted(SANDBOX_ENV_ALLOWLIST):
-        default = defaults.get(name, "")
-        environment_args.append(
-            f'{name}="${{{name}:-{default}}}"'
-        )
+        if name == "PATH" and venv_root:
+            path_default = defaults["PATH"]
+            environment_args.append(
+                f'PATH="{venv_root}/bin:${{PATH:-{path_default}}}"'
+            )
+        elif name == "VIRTUAL_ENV" and venv_root:
+            environment_args.append(f'VIRTUAL_ENV="{venv_root}"')
+        else:
+            default = defaults.get(name, "")
+            environment_args.append(
+                f'{name}="${{{name}:-{default}}}"'
+            )
 
     return "cd /workspace && " + " ".join(environment_args) + " " + shlex.join(argv)
 

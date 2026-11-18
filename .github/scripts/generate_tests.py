@@ -655,7 +655,12 @@ Do not stop after describing the tests. Create the files.
                     environment_ready = environment_verification.get("ready", False)
                 if environment_ready:
                     try:
-                        test_command = sandbox_test_command(validated_command)
+                        test_command = sandbox_test_command(
+                            validated_command,
+                            python_interpreter=environment_verification.get(
+                                "python_interpreter"
+                            ),
+                        )
                         test_result, attempt_records = run_repair_loop(
                             workspace,
                             conversation,
