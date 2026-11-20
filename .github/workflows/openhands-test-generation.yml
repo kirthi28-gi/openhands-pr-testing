@@ -36,10 +36,28 @@ jobs:
           persist-credentials: false
           path: pr-source
 
+      - name: Checkout approved regression tests
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REGRESSION_TESTS_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.REGRESSION_TESTS_TOKEN }}
+          path: regression-source
+          persist-credentials: false
+
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Prepare approved regression tests
+        run: |
+          mkdir -p trusted/regression-input
+          python trusted/.github/scripts/prepare_regression_tests.py \
+            --regression-repo regression-source \
+            --output trusted/regression-input/approved-regression-tests.tar.gz
+
 
       - name: Prepare PR diff
         env:

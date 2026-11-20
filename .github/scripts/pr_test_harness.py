@@ -36,6 +36,63 @@ FAILURE_CATEGORIES = {
     "unknown",
 }
 
+GENERATED_TEST_IMPORT_RULE = (
+    "Trusted automation modules are NOT importable from the /workspace root. "
+    "They live at /workspace/.github/scripts/. If a generated test must import "
+    "one (only when that automation itself is the PR's intended change), add "
+    "sys.path.insert(0, str(Path(__file__).resolve().parents[2] / '.github/scripts')) "
+    "from tests/generated/ before `import generate_tests`. Never assume a bare "
+    "`import generate_tests` works. Prefer not to import automation at all."
+)
+
+REPORT_EVIDENCE_RULE = (
+    "Evidence must be copied verbatim from the authoritative captured output the "
+    "harness provides for that exact attempt. Never copy strings from repository "
+    "test files, fixtures, earlier attempts, or your own expectations. If the "
+    "harness reported a passing run (exit_code 0, e.g. '135 passed'), write "
+    "`failures: []` and put any concern in `blockers`; never invent a failing "
+    "test identifier or assertion message."
+)
+
+DIAGNOSIS_EXAMPLE = json.dumps({
+    "attempt": 1,
+    "category": "incorrect_test",
+    "failing_test": "tests/generated/test_x.py::test_y",
+    "evidence": [
+        "tests/generated/test_x.py::test_y",
+        "E IndexError: pop from empty list",
+    ],
+    "root_cause": "The generated mock had no response for the second call.",
+    "root_cause_evidence": ["E IndexError: pop from empty list"],
+    "repair_action": "Add the missing mock response.",
+}, indent=2)
+
+SCHEMA_HINT = (
+    "Allowed failure categories (canonical snake_case in the report): "
+    + ", ".join(name for name in (
+        "dependency", "environment", "build", "incorrect_test",
+        "application_bug", "regression", "unknown",
+    ))
+    + ".\n"
+    "evidence and root_cause_evidence must be JSON lists of exact quotes "
+    "from the captured test output. Do not use an object, a bare string, or "
+    "paraphrased text.\n"
+    + GENERATED_TEST_IMPORT_RULE + "\n"
+    + REPORT_EVIDENCE_RULE + "\n"
+    "Example diagnosis entry:\n" + DIAGNOSIS_EXAMPLE
+)
+
+
+def diagnosis_prompt_with_schema_hint(message: str) -> str:
+    """Append the shared schema hint to diagnosis and correction prompts."""
+    if (
+        "Diagnose only" in message
+        or "Replace the complete `failures` entry" in message
+    ) and SCHEMA_HINT not in message:
+        return message.rstrip() + "\n\n" + SCHEMA_HINT
+    return message
+
+
 SUPPORTED_PACKAGE_MANAGERS = {"pip", "poetry", "uv", "pipenv"}
 UNSUPPORTED_PACKAGE_MANAGERS = {"conda", "pdm", "pixi", "flit", "hatch"}
 
@@ -1441,21 +1498,90 @@ def load_agent_report(path: Path, attempts: list[dict]) -> dict:
     }
 
 
+def _diagnosis_was_rejected(report: dict, attempts: list[dict] | None = None) -> bool:
+    """Return True when a diagnosis was explicitly rejected by the harness."""
+    candidates = []
+    if isinstance(attempts, list):
+        candidates.extend(attempts)
+    if isinstance(report, dict):
+        history = report.get("repair_history")
+        if isinstance(history, list):
+            candidates.extend(history)
+
+    def indicates_rejection(value) -> bool:
+        if isinstance(value, str):
+            return (
+                "Diagnosis rejected" in value
+                or "Diagnosis correction failed" in value
+            )
+        if isinstance(value, dict):
+            return any(indicates_rejection(item_value) for item_value in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(indicates_rejection(entry) for entry in value)
+        return False
+
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        if indicates_rejection(item.get("diagnosis")):
+            return True
+        if item.get("diagnosis_correction") == "rejected":
+            return True
+        for value in (
+            item.get("repair_decision_reason"),
+            item.get("diagnosis_validation_error"),
+            item.get("diagnosis_recovery_error"),
+            item.get("decision_reason"),
+        ):
+            if indicates_rejection(value):
+                return True
+    return False
+
+
 def final_failure_category(report: dict, attempts: list[dict], environment_ready: bool) -> str | None:
-    """Return only a diagnosis supported by captured output or install evidence."""
-    if attempts:
+    """Return a reporting category supported by environment and diagnosis evidence."""
+    # A genuine environment failure takes precedence over diagnosis evidence.
+    if not environment_ready:
+        if report.get("dependency_installation_failures"):
+            return "dependency"
+        return "environment"
+
+    if isinstance(attempts, list) and attempts:
         final = attempts[-1]
         if final.get("exit_code") == 0:
             return None
+        if _diagnosis_was_rejected(report, attempts):
+            return "diagnosis_rejected"
         diagnoses = [
-            item for item in report["failures"]
-            if item["attempt"] == final["attempt"]
+            item for item in report.get("failures", [])
+            if isinstance(item, dict) and item.get("attempt") == final.get("attempt")
         ]
-        categories = {item["category"] for item in diagnoses}
-        return categories.pop() if len(categories) == 1 else "unknown"
-    if not environment_ready and report["dependency_installation_failures"]:
-        return "dependency"
-    return "environment"
+        categories = {item.get("category") for item in diagnoses}
+        if len(categories) == 1:
+            category = categories.pop()
+            if category == "environment":
+                return "unknown"
+            return category
+        return "unknown"
+
+    if _diagnosis_was_rejected(report, attempts):
+        return "diagnosis_rejected"
+    return "unknown"
+
+
+def workflow_failure_category(
+    report: dict, environment_ready: bool, attempts: list[dict] | None = None
+) -> str:
+    """Return the workflow-level category, consistent with the final category."""
+    return final_failure_category(report, attempts or [], environment_ready) or "unknown"
+
+
+def environment_ready_from_report(report: dict) -> bool:
+    """Infer environment readiness from the report without mutating it."""
+    if isinstance(report, dict) and "environment_ready" in report:
+        return bool(report.get("environment_ready"))
+    environment = report.get("environment") if isinstance(report, dict) else {}
+    return isinstance(environment, dict) and environment.get("status") == "ready"
 
 
 def update_validation_marker(marker: Path, report: dict) -> bool:
@@ -1627,6 +1753,15 @@ def ensure_failure_artifacts(
             report[key] = []
     if not isinstance(report.get("detected_stack"), dict):
         report["detected_stack"] = {}
+    environment_ready = environment_ready_from_report(report)
+    attempt_records = (
+        report.get("harness_attempts")
+        if isinstance(report.get("harness_attempts"), list) else []
+    )
+    final_category = final_failure_category(report, attempt_records, environment_ready)
+    workflow_category = workflow_failure_category(
+        report, environment_ready, attempt_records
+    )
     if not report_was_validated:
         limitations = report.get("limitations", [])
         report["report_validation_errors"] = [
@@ -1637,7 +1772,7 @@ def ensure_failure_artifacts(
         report["dependency_installation_failures"] = []
         report["modified_files"] = []
         report["proposed_patches"] = []
-        report["final_failure_category"] = "environment"
+        report["final_failure_category"] = final_category or "unknown"
         report["blockers"].append(
             "Execution ended before the agent report could be validated."
         )
@@ -1652,8 +1787,8 @@ def ensure_failure_artifacts(
         environment["status"] = "blocked"
     report["environment"] = environment
     if not report.get("final_failure_category"):
-        report["final_failure_category"] = "environment"
-    report["workflow_failure_category"] = "environment"
+        report["final_failure_category"] = final_category or "unknown"
+    report["workflow_failure_category"] = workflow_category
 
     patch_path = output_dir / "openhands-application.patch"
     if patch_path.exists():
@@ -1835,6 +1970,28 @@ def validate_repair_diagnosis(report_text: str, attempt: int, output: str) -> di
     return result
 
 
+def generated_test_quarantine_id(diagnosis: dict, output: str) -> str | None:
+    """Return a validated generated-test id that the harness may quarantine."""
+    if not isinstance(diagnosis, dict) or not diagnosis.get("validated"):
+        return None
+    if diagnosis.get("category") != "incorrect test":
+        return None
+    test_id = diagnosis.get("failing_test")
+    if not isinstance(test_id, str) or not test_id.strip():
+        return None
+    if test_id not in _failing_test_identifiers(output):
+        return None
+    if not test_id.startswith("tests/generated/"):
+        return None
+    if ".." in Path(test_id).parts:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in test_id):
+        return None
+    if re.search(r'["`$\\;|&]', test_id):
+        return None
+    return test_id
+
+
 def _check_generated_tests(test_guard, stage: str) -> dict:
     if test_guard is None:
         return {"unchanged": True, "changed_paths": [], "errors": [], "restored": False}
@@ -1888,6 +2045,8 @@ def run_repair_loop(
     attempts = []
     final_result = None
     pending_repair_index = None
+    current_command = test_command
+    quarantined_tests = set()
     for attempt in range(max_repairs + 1):
         integrity = _check_generated_tests(generated_tests_guard, "before test run")
         if not integrity.get("unchanged"):
@@ -1895,7 +2054,7 @@ def run_repair_loop(
                 attempts[pending_repair_index]["repair_status"] = "repair_not_verified_test_integrity_failed"
             attempts.append({
                 "attempt": attempt + 1,
-                "command": test_command,
+                "command": current_command,
                 "exit_code": None,
                 "output": "",
                 "test_integrity": integrity,
@@ -1910,13 +2069,13 @@ def run_repair_loop(
             )
             break
         try:
-            result = workspace.execute_command(test_command, timeout=1200)
+            result = workspace.execute_command(current_command, timeout=1200)
         except Exception as exc:
             if pending_repair_index is not None:
                 attempts[pending_repair_index]["repair_status"] = "repair_not_verified_test_execution_failed"
             attempts.append({
                 "attempt": attempt + 1,
-                "command": test_command,
+                "command": current_command,
                 "exit_code": None,
                 "output": "",
                 "execution_error": type(exc).__name__,
@@ -1928,7 +2087,7 @@ def run_repair_loop(
         output = (result.stdout or "") + (result.stderr or "")
         attempts.append({
             "attempt": attempt + 1,
-            "command": test_command,
+            "command": current_command,
             "exit_code": result.exit_code,
             "output": output[-12000:],
         })
@@ -1960,7 +2119,7 @@ def run_repair_loop(
         # Diagnosis and repair are separate turns. Unclassified failures never
         # authorize an application edit.
         try:
-            conversation.send_message(f"""
+            conversation.send_message(diagnosis_prompt_with_schema_hint(f"""
 The complete test command failed on attempt {attempt + 1} of {max_repairs + 1}.
 
 Actual output follows:
@@ -1975,7 +2134,7 @@ repair_action. Use unknown if the cause is uncertain or no exact test
 identifier is available. Do not claim the suite
 passed. Do not classify dependency, environment, build or invalid-test
 failures as application bugs.
-""")
+"""))
             conversation.run()
         except Exception as exc:
             attempts[-1]["diagnosis_error"] = type(exc).__name__
@@ -2002,7 +2161,7 @@ failures as application bugs.
         if not diagnosis["validated"]:
             attempts[-1]["diagnosis_validation_error"] = diagnosis["decision_reason"]
             try:
-                conversation.send_message(f"""
+                conversation.send_message(diagnosis_prompt_with_schema_hint(f"""
 The harness rejected the diagnosis report for attempt {attempt + 1}:
 {diagnosis['decision_reason']}
 
@@ -2019,7 +2178,7 @@ repair in this turn.
 
 Captured test output:
 {output[-12000:]}
-""")
+"""))
                 conversation.run()
                 retry_integrity = _check_generated_tests(
                     generated_tests_guard, "after diagnosis correction"
@@ -2040,6 +2199,46 @@ Captured test output:
                     f"Diagnosis correction failed: {type(exc).__name__}: {exc}; human review required."
                 )
         attempts[-1]["diagnosis"] = diagnosis
+
+        quarantine_id = generated_test_quarantine_id(diagnosis, output)
+        if quarantine_id is not None:
+            attempts[-1]["quarantined_test"] = quarantine_id
+            attempts[-1]["quarantine_reason"] = (
+                diagnosis.get("root_cause") or diagnosis.get("decision_reason", "")
+            )
+            attempts[-1]["quarantine_evidence"] = diagnosis.get("evidence", [])
+            if quarantine_id in quarantined_tests:
+                attempts[-1]["quarantine_repeated"] = True
+                attempts[-1]["repair_decision"] = "human_review"
+                attempts[-1]["repair_decision_reason"] = (
+                    f"Generated test {quarantine_id} was already quarantined; "
+                    "refusing to quarantine it again."
+                )
+                break
+            quarantined_tests.add(quarantine_id)
+
+            quarantine_integrity = _check_generated_tests(
+                generated_tests_guard, "before quarantined rerun"
+            )
+            attempts[-1]["quarantine_integrity"] = quarantine_integrity
+            if not quarantine_integrity.get("unchanged"):
+                attempts[-1]["repair_decision"] = "human_review"
+                attempts[-1]["repair_decision_reason"] = (
+                    "Test integrity guard failed before quarantined rerun."
+                )
+                break
+
+            attempts[-1]["repair_decision"] = "test_quarantined"
+            attempts[-1]["repair_decision_reason"] = (
+                f"Generated test {quarantine_id} was invalid and quarantined "
+                "with pytest --deselect."
+            )
+            if attempt == max_repairs:
+                attempts[-1]["quarantine_status"] = "limit_reached_no_rerun"
+                break
+            attempts[-1]["quarantine_status"] = "pending_rerun"
+            current_command = current_command + " --deselect " + shlex.quote(quarantine_id)
+            continue
 
         if not diagnosis["repair_allowed"]:
             attempts[-1]["repair_decision"] = "human_review"

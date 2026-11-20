@@ -9,6 +9,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".github/scripts"))
 
 from pr_test_harness import (
+    GENERATED_TEST_IMPORT_RULE,
+    REPORT_EVIDENCE_RULE,
+    SCHEMA_HINT,
     ensure_failure_artifacts,
     ensure_generated_tests_unchanged,
     ensure_repository_tests_unchanged,
@@ -210,6 +213,10 @@ def test_incomplete_diagnosis_gets_one_correction_turn_then_repairs():
     assert len(conversation.messages) == 3  # diagnose, correct report, repair
     assert "Replace the complete `failures` entry" in conversation.messages[1]
     assert "Preserve every other entry" in conversation.messages[1]
+    for message in conversation.messages[:2]:
+        assert SCHEMA_HINT in message
+        assert GENERATED_TEST_IMPORT_RULE in message
+        assert REPORT_EVIDENCE_RULE in message
 
 
 def test_rejected_diagnosis_correction_still_blocks_application_repair():
