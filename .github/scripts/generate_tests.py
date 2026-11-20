@@ -20,6 +20,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from pr_test_harness import (
+    DIAGNOSIS_EXAMPLE,
+    GENERATED_TEST_IMPORT_RULE,
+    REPORT_EVIDENCE_RULE,
+    SCHEMA_HINT,
+    diagnosis_prompt_with_schema_hint,
     ensure_failure_artifacts,
     capture_generated_tests_snapshot,
     capture_repository_tests_snapshot,
@@ -154,30 +159,6 @@ DIAGNOSIS_CATEGORY_ALIASES = {
     "incorrect test": "incorrect test",
     "application bug": "application bug",
 }
-DIAGNOSIS_EXAMPLE = json.dumps({
-    "attempt": 1,
-    "category": "incorrect_test",
-    "failing_test": "tests/generated/test_x.py::test_y",
-    "evidence": [
-        "tests/generated/test_x.py::test_y",
-        "E IndexError: pop from empty list",
-    ],
-    "root_cause": "The generated mock had no response for the second call.",
-    "root_cause_evidence": ["E IndexError: pop from empty list"],
-    "repair_action": "Add the missing mock response.",
-}, indent=2)
-SCHEMA_HINT = (
-    "Allowed failure categories (canonical snake_case in the report): "
-    + ", ".join(name for name in (
-        "dependency", "environment", "build", "incorrect_test",
-        "application_bug", "regression", "unknown",
-    ))
-    + ".\n"
-    "evidence and root_cause_evidence must be JSON lists of exact quotes "
-    "from the captured test output. Do not use an object, a bare string, or "
-    "paraphrased text.\n"
-    "Example diagnosis entry:\n" + DIAGNOSIS_EXAMPLE
-)
 
 
 def normalize_diagnosis_report(report_text: str) -> str:
@@ -295,18 +276,6 @@ def validate_repair_diagnosis_compatible(report_text: str, attempt: int, output:
     )
 
 
-def diagnosis_prompt_with_schema_hint(message: str) -> str:
-    """Append the schema hint to diagnosis and correction prompts."""
-    if not isinstance(message, str):
-        return message
-    if (
-        "Diagnose only" in message
-        or "Replace the complete `failures` entry" in message
-    ) and SCHEMA_HINT not in message:
-        return message.rstrip() + "\n\n" + SCHEMA_HINT
-    return message
-
-
 def is_valid_generated_test_validation_command(command) -> bool:
     """Accept only the exact trusted generated-test validation command."""
     return command == GENERATED_TEST_VALIDATION_COMMAND
@@ -322,7 +291,12 @@ The generated-test validation command failed on attempt {attempt} of
 
 Fix ONLY test-authoring mistakes in the test files you created during this
 session in tests/generated/, such as incorrect mocks, incorrect expected call
-counts, incorrect assumptions, or incomplete mock responses.
+counts, incorrect assumptions, or incomplete mock responses. A
+ModuleNotFoundError for a trusted automation module is also a fixable
+test-authoring import-path mistake: correct the sys.path/import in your own
+test file, never edit the trusted module itself.
+
+{GENERATED_TEST_IMPORT_RULE}
 
 You must NOT modify application code, existing repository tests, pre-existing
 generated tests, dependency manifests, lockfiles, test configuration, or any
@@ -959,6 +933,7 @@ YOUR TASK
     If a failure appears to expose a genuine application bug, preserve the test
     unchanged and write `suspected_bugs` with the exact failing test identifier,
     verbatim evidence and an evidence-backed reason.
+    {GENERATED_TEST_IMPORT_RULE}
 12. In response to a harness failure only, attempt no more than
     {max(0, min(int(os.getenv("MAX_REPAIR_ATTEMPTS", "2")), 3))} repairs.
     Do not edit application code during preparation or diagnosis. Only the
@@ -983,7 +958,9 @@ YOUR TASK
     Each failed dependency installation must include its package `name`,
     `manager`, exact `command`, nonzero `exit_code`, and actual `output`.
     Report environment preparation as `ready` or `blocked`, with blocker
-    details. Never include credentials or environment values. Also create
+    details.
+    {REPORT_EVIDENCE_RULE}
+    Never include credentials or environment values. Also create
     /workspace/openhands-test-command containing only the inspected,
     single-line repository-native test command (no shebang, shell wrappers,
     operators, redirections, substitutions, installation, or network access).

@@ -36,6 +36,63 @@ FAILURE_CATEGORIES = {
     "unknown",
 }
 
+GENERATED_TEST_IMPORT_RULE = (
+    "Trusted automation modules are NOT importable from the /workspace root. "
+    "They live at /workspace/.github/scripts/. If a generated test must import "
+    "one (only when that automation itself is the PR's intended change), add "
+    "sys.path.insert(0, str(Path(__file__).resolve().parents[2] / '.github/scripts')) "
+    "from tests/generated/ before `import generate_tests`. Never assume a bare "
+    "`import generate_tests` works. Prefer not to import automation at all."
+)
+
+REPORT_EVIDENCE_RULE = (
+    "Evidence must be copied verbatim from the authoritative captured output the "
+    "harness provides for that exact attempt. Never copy strings from repository "
+    "test files, fixtures, earlier attempts, or your own expectations. If the "
+    "harness reported a passing run (exit_code 0, e.g. '135 passed'), write "
+    "`failures: []` and put any concern in `blockers`; never invent a failing "
+    "test identifier or assertion message."
+)
+
+DIAGNOSIS_EXAMPLE = json.dumps({
+    "attempt": 1,
+    "category": "incorrect_test",
+    "failing_test": "tests/generated/test_x.py::test_y",
+    "evidence": [
+        "tests/generated/test_x.py::test_y",
+        "E IndexError: pop from empty list",
+    ],
+    "root_cause": "The generated mock had no response for the second call.",
+    "root_cause_evidence": ["E IndexError: pop from empty list"],
+    "repair_action": "Add the missing mock response.",
+}, indent=2)
+
+SCHEMA_HINT = (
+    "Allowed failure categories (canonical snake_case in the report): "
+    + ", ".join(name for name in (
+        "dependency", "environment", "build", "incorrect_test",
+        "application_bug", "regression", "unknown",
+    ))
+    + ".\n"
+    "evidence and root_cause_evidence must be JSON lists of exact quotes "
+    "from the captured test output. Do not use an object, a bare string, or "
+    "paraphrased text.\n"
+    + GENERATED_TEST_IMPORT_RULE + "\n"
+    + REPORT_EVIDENCE_RULE + "\n"
+    "Example diagnosis entry:\n" + DIAGNOSIS_EXAMPLE
+)
+
+
+def diagnosis_prompt_with_schema_hint(message: str) -> str:
+    """Append the shared schema hint to diagnosis and correction prompts."""
+    if (
+        "Diagnose only" in message
+        or "Replace the complete `failures` entry" in message
+    ) and SCHEMA_HINT not in message:
+        return message.rstrip() + "\n\n" + SCHEMA_HINT
+    return message
+
+
 SUPPORTED_PACKAGE_MANAGERS = {"pip", "poetry", "uv", "pipenv"}
 UNSUPPORTED_PACKAGE_MANAGERS = {"conda", "pdm", "pixi", "flit", "hatch"}
 
@@ -2062,7 +2119,7 @@ def run_repair_loop(
         # Diagnosis and repair are separate turns. Unclassified failures never
         # authorize an application edit.
         try:
-            conversation.send_message(f"""
+            conversation.send_message(diagnosis_prompt_with_schema_hint(f"""
 The complete test command failed on attempt {attempt + 1} of {max_repairs + 1}.
 
 Actual output follows:
@@ -2077,7 +2134,7 @@ repair_action. Use unknown if the cause is uncertain or no exact test
 identifier is available. Do not claim the suite
 passed. Do not classify dependency, environment, build or invalid-test
 failures as application bugs.
-""")
+"""))
             conversation.run()
         except Exception as exc:
             attempts[-1]["diagnosis_error"] = type(exc).__name__
@@ -2104,7 +2161,7 @@ failures as application bugs.
         if not diagnosis["validated"]:
             attempts[-1]["diagnosis_validation_error"] = diagnosis["decision_reason"]
             try:
-                conversation.send_message(f"""
+                conversation.send_message(diagnosis_prompt_with_schema_hint(f"""
 The harness rejected the diagnosis report for attempt {attempt + 1}:
 {diagnosis['decision_reason']}
 
@@ -2121,7 +2178,7 @@ repair in this turn.
 
 Captured test output:
 {output[-12000:]}
-""")
+"""))
                 conversation.run()
                 retry_integrity = _check_generated_tests(
                     generated_tests_guard, "after diagnosis correction"

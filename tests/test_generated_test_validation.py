@@ -311,3 +311,23 @@ def test_invalid_generated_test_receives_ordinary_correction(tmp_path):
     assert result["classification"] == "passed"
     assert result["results"][0]["classification"] == "invalid_generated_test"
     assert conversation.runs == 1
+
+
+def test_generated_test_fix_prompt_recognizes_automation_import_mistakes():
+    text = gt.generated_test_fix_prompt(
+        1, "ModuleNotFoundError: No module named 'generate_tests'"
+    )
+
+    assert gt.GENERATED_TEST_IMPORT_RULE in text
+    assert "import-path mistake" in text
+    assert "never edit the trusted module itself" in text
+
+
+def test_generation_prompt_includes_both_new_rules():
+    source = (Path(__file__).resolve().parents[1] / ".github/scripts/generate_tests.py").read_text(
+        encoding="utf-8"
+    )
+    task_section = source.split("YOUR TASK", 1)[1].split("{SCHEMA_HINT}", 1)[0]
+
+    assert "{GENERATED_TEST_IMPORT_RULE}" in task_section
+    assert "{REPORT_EVIDENCE_RULE}" in task_section

@@ -213,6 +213,57 @@ def test_final_report_fabricated_evidence_is_still_rejected(tmp_path):
     assert any("does not match captured output" in error for error in validated["report_validation_errors"])
 
 
+PASSING_ATTEMPTS = [{
+    "attempt": 1,
+    "exit_code": 0,
+    "output": "135 passed in 4.90s\n",
+}]
+
+
+def test_generated_test_import_rule_documents_workspace_path_and_parents2():
+    assert "/workspace/.github/scripts" in gt.GENERATED_TEST_IMPORT_RULE
+    assert "parents[2]" in gt.GENERATED_TEST_IMPORT_RULE
+    assert "import generate_tests" in gt.GENERATED_TEST_IMPORT_RULE
+
+
+def test_report_evidence_rule_forbids_fixtures_and_fabricated_passing_failures():
+    assert "verbatim" in gt.REPORT_EVIDENCE_RULE
+    assert "fixtures" in gt.REPORT_EVIDENCE_RULE
+    assert "failures: []" in gt.REPORT_EVIDENCE_RULE
+
+
+def test_schema_hint_includes_both_prompt_rules():
+    assert gt.GENERATED_TEST_IMPORT_RULE in gt.SCHEMA_HINT
+    assert gt.REPORT_EVIDENCE_RULE in gt.SCHEMA_HINT
+
+
+def test_fabricated_fixture_evidence_is_rejected_when_suite_passes(tmp_path):
+    """Replay the CI failure: fixture text must not validate as evidence."""
+    report = _final_report([
+        "FAILED tests/generated/test_math.py::test_add",
+        "E AssertionError: expected 3, got 2",
+    ])
+
+    normalized = json.loads(
+        gt.normalize_final_agent_report(json.dumps(report), PASSING_ATTEMPTS)
+    )
+    assert normalized["failures"][0]["evidence"] == []
+
+    path = tmp_path / "openhands-report.json"
+    path.write_text(json.dumps(normalized), encoding="utf-8")
+    validated = load_agent_report(path, PASSING_ATTEMPTS)
+
+    assert any(
+        "does not match captured output" in error
+        for error in validated["report_validation_errors"]
+    )
+    assert any(
+        "does not match a failed test run" in error
+        for error in validated["report_validation_errors"]
+    )
+    assert validated["report_validation_errors"] != []
+
+
 def test_final_report_normalization_preserves_unrelated_fields():
     report = _final_report(
         ["tests/test_math.py::test_add"],
