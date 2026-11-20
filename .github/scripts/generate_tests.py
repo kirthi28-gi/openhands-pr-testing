@@ -1,6 +1,7 @@
 
 import json
 import os
+import re
 import platform
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from pr_test_harness import (
     capture_repository_tests_snapshot,
     ensure_generated_tests_unchanged,
     ensure_repository_tests_unchanged,
+    _redact_sensitive_values,
     files_in_unified_diff,
     final_failure_category,
     load_agent_report,
@@ -34,13 +36,509 @@ from pr_test_harness import (
     update_validation_marker,
     validate_test_command,
     verify_test_environment,
+    workflow_failure_category,
 )
+
+import pr_test_harness as harness
 
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, Conversation
 from openhands.tools.preset.default import get_default_agent
 from openhands.workspace import DockerWorkspace
+
+
+GENERATED_TEST_VALIDATION_COMMAND = (
+    "/workspace/.venv/bin/python -m pytest tests/generated -q"
+)
+MAX_GENERATED_TEST_VALIDATION_ATTEMPTS = 3
+SUSPECTED_BUGS_REPORT = "openhands-suspected-bugs.json"
+
+def report_failure_categories(report: dict, attempt_records: list, environment_ready: bool):
+    """Return the final and workflow failure categories from one source."""
+    final_category = final_failure_category(
+        report, attempt_records, environment_ready
+    )
+    workflow_category = workflow_failure_category(
+        report, environment_ready, attempt_records
+    )
+    return final_category, workflow_category
+
+
+def write_summary_text(summary_path: str | None, text: str) -> None:
+    """Append text to the GitHub Actions step summary when configured."""
+    if not summary_path:
+        return
+    with open(summary_path, "a", encoding="utf-8") as summary:
+        summary.write(text)
+
+
+def normal_summary_text(
+    pr_number,
+    base_sha,
+    head_sha,
+    server_image,
+    test_result,
+    attempt_records,
+    report,
+) -> str:
+    """Render the normal-path GitHub Actions summary."""
+    return (
+        f"## OpenHands PR Test Report\n\n"
+        f"- PR: #{pr_number}\n"
+        f"- Base: `{base_sha}`\n"
+        f"- Head: `{head_sha}`\n"
+        f"- Sandbox: `{server_image}`\n"
+        f"- Result: {'PASSED' if test_result.exit_code == 0 else 'FAILED'}\n"
+        f"- Failure category: {report['final_failure_category'] or 'none'}\n"
+        f"- Workflow failure category: {report['workflow_failure_category'] or 'none'}\n"
+        f"- Attempts: {len(attempt_records)}\n\n"
+        f"- Agent report valid: {'yes' if report['report_valid'] else 'no'}\n\n"
+        f"### Repository test results\n\n"
+        f"```text\n{test_result.stdout or ''}\n{test_result.stderr or ''}\n```\n\n"
+        f"Machine-readable report and patches: `openhands-report.json` artifact.\n"
+    )
+
+
+def fallback_summary_text(error_name: str, final_category, workflow_category) -> str:
+    """Render the exception/fallback GitHub Actions summary."""
+    return (
+        "\n## OpenHands PR Test Report\n\n"
+        f"- Result: Failed before verified completion ({error_name}).\n"
+        f"- Failure category: {final_category or 'none'}\n"
+        f"- Workflow failure category: {workflow_category or 'none'}\n"
+        "- A failure report and generated-tests artifact were retained.\n"
+    )
+
+
+def fallback_report_categories(output_dir: Path) -> tuple[str, str]:
+    """Read categories from the fallback JSON report written by the harness."""
+    report_path = output_dir / "openhands-report.json"
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return "none", "none"
+    if not isinstance(data, dict):
+        return "none", "none"
+    return (
+        data.get("final_failure_category") or "none",
+        data.get("workflow_failure_category") or "none",
+    )
+
+
+def quarantined_tests_from_attempts(attempt_records: list) -> list:
+    """Collect quarantined generated tests from repair-loop attempt records."""
+    records = []
+    for item in attempt_records or []:
+        if not isinstance(item, dict) or not item.get("quarantined_test"):
+            continue
+        records.append({
+            "attempt": item.get("attempt"),
+            "test": item.get("quarantined_test"),
+            "reason": item.get("quarantine_reason"),
+            "evidence": item.get("quarantine_evidence", []),
+            "status": item.get("quarantine_status"),
+        })
+    return records
+
+
+DIAGNOSIS_CATEGORY_ALIASES = {
+    "dependency": "dependency",
+    "environment": "environment",
+    "build": "build",
+    "incorrect_test": "incorrect test",
+    "application_bug": "application bug",
+    "regression": "regression",
+    "unknown": "unknown",
+    # Accept the validator's existing labels as well; no category is renamed.
+    "incorrect test": "incorrect test",
+    "application bug": "application bug",
+}
+DIAGNOSIS_EXAMPLE = json.dumps({
+    "attempt": 1,
+    "category": "incorrect_test",
+    "failing_test": "tests/generated/test_x.py::test_y",
+    "evidence": [
+        "tests/generated/test_x.py::test_y",
+        "E IndexError: pop from empty list",
+    ],
+    "root_cause": "The generated mock had no response for the second call.",
+    "root_cause_evidence": ["E IndexError: pop from empty list"],
+    "repair_action": "Add the missing mock response.",
+}, indent=2)
+SCHEMA_HINT = (
+    "Allowed failure categories (canonical snake_case in the report): "
+    + ", ".join(name for name in (
+        "dependency", "environment", "build", "incorrect_test",
+        "application_bug", "regression", "unknown",
+    ))
+    + ".\n"
+    "evidence and root_cause_evidence must be JSON lists of exact quotes "
+    "from the captured test output. Do not use an object, a bare string, or "
+    "paraphrased text.\n"
+    "Example diagnosis entry:\n" + DIAGNOSIS_EXAMPLE
+)
+
+
+def normalize_diagnosis_report(report_text: str) -> str:
+    """Normalize agent diagnosis fields without changing validator semantics."""
+    try:
+        raw = json.loads(report_text)
+    except (TypeError, ValueError):
+        return report_text
+    if not isinstance(raw, dict) or not isinstance(raw.get("failures"), list):
+        return report_text
+
+    for item in raw["failures"]:
+        if not isinstance(item, dict):
+            continue
+        category = item.get("category")
+        if isinstance(category, str) and category in DIAGNOSIS_CATEGORY_ALIASES:
+            item["category"] = DIAGNOSIS_CATEGORY_ALIASES[category]
+
+        for key in ("evidence", "root_cause_evidence"):
+            value = item.get(key)
+            quotes = []
+            if isinstance(value, str):
+                quotes = value.splitlines() or [value]
+            elif isinstance(value, list):
+                quotes = value
+
+            normalized = []
+            for quote in quotes:
+                if not isinstance(quote, str):
+                    normalized.append(quote)
+                    continue
+                collapsed = " ".join(quote.split())
+                if not collapsed:
+                    continue
+                normalized.append(collapsed)
+                for marker in ("FAILED ", "ERROR "):
+                    if marker in collapsed:
+                        candidate = collapsed.split(marker, 1)[1].split(" ", 1)[0]
+                        if "::" in candidate and candidate not in normalized:
+                            normalized.append(candidate)
+            item[key] = normalized
+    return json.dumps(raw)
+
+
+def _evidence_quote_from_output(quote, output: str):
+    """Return an exact output substring for a whitespace-normalized quote."""
+    if not isinstance(quote, str) or not quote.strip():
+        return None
+    if quote in output:
+        return quote
+    tokens = quote.split()
+    if not tokens:
+        return None
+    pattern = re.compile(r"\s+".join(re.escape(token) for token in tokens))
+    match = pattern.search(output)
+    return match.group(0) if match else None
+
+
+def normalize_final_agent_report(report_text: str, attempt_records: list) -> str:
+    """Normalize only failure entries before final agent-report validation."""
+    try:
+        raw = json.loads(report_text)
+    except (TypeError, ValueError):
+        return report_text
+    if not isinstance(raw, dict) or not isinstance(raw.get("failures"), list):
+        return report_text
+
+    outputs = {
+        item.get("attempt"): str(item.get("output") or "")
+        for item in attempt_records
+        if isinstance(item, dict)
+    }
+    for item in raw["failures"]:
+        if not isinstance(item, dict):
+            continue
+
+        category = item.get("category")
+        if isinstance(category, str) and category in DIAGNOSIS_CATEGORY_ALIASES:
+            item["category"] = DIAGNOSIS_CATEGORY_ALIASES[category]
+
+        evidence = item.get("evidence")
+        if isinstance(evidence, str):
+            quotes = evidence.splitlines() or [evidence]
+        elif isinstance(evidence, list):
+            quotes = evidence
+        else:
+            quotes = []
+
+        output = outputs.get(item.get("attempt"), "")
+        normalized = []
+        fabricated = False
+        for quote in quotes:
+            exact = _evidence_quote_from_output(quote, output)
+            if exact is None:
+                fabricated = True
+                break
+            if exact not in normalized:
+                normalized.append(exact)
+        # Never silently discard fabricated evidence and leave a report looking
+        # valid; fail closed so the existing validator rejects the failure.
+        item["evidence"] = [] if fabricated else normalized
+
+    return json.dumps(raw)
+
+
+def validate_repair_diagnosis_compatible(report_text: str, attempt: int, output: str) -> dict:
+    """Compatibility wrapper around the harness diagnosis validator."""
+    normalized_report = normalize_diagnosis_report(report_text)
+    raw_output = str(output or "")
+    # Preserve line structure for failing-test extraction while allowing
+    # whitespace-normalized evidence comparison.
+    comparison_output = raw_output + "\n" + " ".join(raw_output.split())
+    return harness.validate_repair_diagnosis(
+        normalized_report, attempt, comparison_output
+    )
+
+
+def diagnosis_prompt_with_schema_hint(message: str) -> str:
+    """Append the schema hint to diagnosis and correction prompts."""
+    if not isinstance(message, str):
+        return message
+    if (
+        "Diagnose only" in message
+        or "Replace the complete `failures` entry" in message
+    ) and SCHEMA_HINT not in message:
+        return message.rstrip() + "\n\n" + SCHEMA_HINT
+    return message
+
+
+def is_valid_generated_test_validation_command(command) -> bool:
+    """Accept only the exact trusted generated-test validation command."""
+    return command == GENERATED_TEST_VALIDATION_COMMAND
+
+
+def generated_test_fix_prompt(attempt: int, output: str) -> str:
+    """Return a bounded prompt for fixing only newly generated tests."""
+    return f"""
+The generated-test validation command failed on attempt {attempt} of
+{MAX_GENERATED_TEST_VALIDATION_ATTEMPTS}. Actual output follows:
+
+{output[-12000:]}
+
+Fix ONLY test-authoring mistakes in the test files you created during this
+session in tests/generated/, such as incorrect mocks, incorrect expected call
+counts, incorrect assumptions, or incomplete mock responses.
+
+You must NOT modify application code, existing repository tests, pre-existing
+generated tests, dependency manifests, lockfiles, test configuration, or any
+trusted automation. You must NOT delete, skip, rename, weaken, or remove a
+failing test. Do not change the validation command.
+
+If the failure appears to expose a genuine application bug, preserve the test
+unchanged and record it in `suspected_bugs` with the exact failing test
+identifier, verbatim evidence quoted from the output above, and an
+evidence-backed reason. Write {SUSPECTED_BUGS_REPORT} in /workspace as a JSON
+object with a `suspected_bugs` list. Do not claim success; the harness will
+rerun the validation command.
+"""
+
+
+def validate_generated_tests(
+    workspace,
+    conversation,
+    temp_dir: Path | None = None,
+    integrity_guard=None,
+) -> dict:
+    """Run generated tests before the final snapshot; allow at most 3 attempts."""
+    results = []
+    suspected_bugs = []
+    blocked = False
+    errors = []
+    guard_checks = []
+
+    def _tail(text: str) -> str:
+        return _redact_sensitive_values(text)[-12000:]
+
+    def _guard(stage: str) -> bool:
+        if integrity_guard is None:
+            return True
+        try:
+            check = integrity_guard()
+        except Exception as exc:
+            check = {"unchanged": False, "errors": [f"{type(exc).__name__}: {exc}"]}
+        guard_checks.append({
+            "stage": stage,
+            "unchanged": bool(check.get("unchanged")),
+            "errors": check.get("errors", []),
+        })
+        return bool(check.get("unchanged"))
+
+    for attempt in range(1, MAX_GENERATED_TEST_VALIDATION_ATTEMPTS + 1):
+        if not _guard(f"before command attempt {attempt}"):
+            errors.append(f"integrity guard failed before validation command attempt {attempt}")
+            blocked = True
+            break
+
+        try:
+            result = workspace.execute_command(
+                GENERATED_TEST_VALIDATION_COMMAND, timeout=600
+            )
+            exit_code = result.exit_code
+            output = _tail((result.stdout or "") + "\n" + (result.stderr or ""))
+        except Exception as exc:
+            exit_code = None
+            output = _tail(f"{type(exc).__name__}: {exc}")
+
+        record = {
+            "attempt": attempt,
+            "command": GENERATED_TEST_VALIDATION_COMMAND,
+            "exit_code": exit_code,
+            "output": output,
+            "classification": None,
+            "suspected_bugs": [],
+        }
+        results.append(record)
+
+        if not _guard(f"after command attempt {attempt}"):
+            errors.append(f"integrity guard failed after validation command attempt {attempt}")
+            blocked = True
+            break
+
+        if exit_code == 0:
+            if not _guard("before validation success"):
+                errors.append("integrity guard failed before returning validation success")
+                blocked = True
+                break
+            record["classification"] = "passed"
+            return {
+                "valid": True,
+                "blocked": False,
+                "attempts": attempt,
+                "results": results,
+                "errors": [],
+                "suspected_bugs": suspected_bugs,
+                "classification": "passed",
+                "guard_checks": guard_checks,
+            }
+
+        # A failed pytest run may be an application bug. Inspect the agent's
+        # report before asking for any generated-test correction.
+        attempt_bugs = (
+            read_suspected_bugs(workspace, temp_dir, output)
+            if temp_dir is not None else []
+        )
+        if attempt_bugs:
+            for bug in attempt_bugs:
+                if bug not in suspected_bugs:
+                    suspected_bugs.append(bug)
+            record["classification"] = "suspected_application_bug"
+            record["suspected_bugs"] = attempt_bugs
+            errors.append(
+                "pytest still failing; suspected application bug preserved: "
+                + ", ".join(bug["failing_test"] for bug in attempt_bugs)
+            )
+            blocked = True
+            break
+
+        record["classification"] = "invalid_generated_test"
+        if attempt == MAX_GENERATED_TEST_VALIDATION_ATTEMPTS:
+            errors.append(
+                "generated tests did not pass within "
+                f"{MAX_GENERATED_TEST_VALIDATION_ATTEMPTS} validation attempts"
+            )
+            break
+
+        try:
+            conversation.send_message(generated_test_fix_prompt(attempt, output))
+            conversation.run()
+        except Exception as exc:
+            errors.append(f"agent correction turn failed: {type(exc).__name__}: {exc}")
+            blocked = True
+            break
+
+        if not _guard(f"after correction attempt {attempt}"):
+            errors.append("integrity guard failed after generated-test correction")
+            blocked = True
+            break
+
+    classification = (
+        "suspected_application_bug"
+        if suspected_bugs
+        else ("invalid_generated_test" if results else "not_run")
+    )
+    return {
+        "valid": False,
+        "blocked": blocked,
+        "attempts": len(results),
+        "results": results,
+        "errors": errors,
+        "suspected_bugs": suspected_bugs,
+        "classification": classification,
+        "guard_checks": guard_checks,
+    }
+
+
+def read_suspected_bugs(workspace, temp_dir: Path, output: str | None = None) -> list:
+    """Read suspected bugs and verify them against captured pytest output."""
+    destination = Path(temp_dir) / SUSPECTED_BUGS_REPORT
+    download = workspace.file_download(
+        source_path=f"/workspace/{SUSPECTED_BUGS_REPORT}",
+        destination_path=str(destination),
+    )
+    if not download.success:
+        return []
+    try:
+        data = json.loads(destination.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return []
+    bugs = data.get("suspected_bugs", []) if isinstance(data, dict) else []
+    if not isinstance(bugs, list):
+        return []
+    clean = []
+    for item in bugs:
+        if not isinstance(item, dict):
+            continue
+        failing_test = item.get("failing_test")
+        evidence = item.get("evidence")
+        reason = item.get("reason")
+        if (
+            not isinstance(failing_test, str) or not failing_test.strip()
+            or not isinstance(evidence, list) or not evidence
+            or any(not isinstance(quote, str) or not quote.strip() for quote in evidence)
+            or not isinstance(reason, str) or not reason.strip()
+        ):
+            continue
+        if output is not None:
+            if failing_test not in output:
+                continue
+            if any(quote not in output for quote in evidence):
+                continue
+        clean.append({
+            "failing_test": failing_test,
+            "evidence": evidence,
+            "reason": reason,
+        })
+    return clean
+
+
+def sandbox_application_unchanged(workspace) -> dict:
+    """Detect application-code changes outside generated tests and metadata."""
+    diff_path = "/tmp/openhands-generated-validation.diff"
+    command = (
+        "diff -ruN "
+        "--exclude=.git --exclude=.venv --exclude=node_modules "
+        "--exclude=__pycache__ --exclude=.pytest_cache "
+        "--exclude=target --exclude=build --exclude=dist "
+        "--exclude=tests/generated --exclude=PR_DIFF.md "
+        "--exclude=openhands-test-command --exclude=openhands-report.json "
+        "--exclude=openhands-suspected-bugs.json "
+        "--exclude=openhands-application.patch "
+        "--exclude=openhands-application.raw.patch --exclude=generated-tests.tar.gz "
+        f"/tmp/openhands-pr-baseline /workspace > {diff_path}; "
+        f"code=$?; test $code -le 1 && test ! -s {diff_path}"
+    )
+    result = workspace.execute_command(command, timeout=120)
+    return {
+        "unchanged": result.exit_code == 0,
+        "output": _redact_sensitive_values(
+            (result.stdout or "") + "\n" + (result.stderr or "")
+        )[-4000:],
+    }
 
 
 def run_checked(workspace, command, timeout=600):
@@ -268,6 +766,46 @@ def _main():
                     f"Safe PR source extraction failed: {upload.stderr}"
                 )
 
+            # Transfer approved regression tests from the trusted runner.
+            regression_archive = (
+                automation_dir
+                / "regression-input"
+                / "approved-regression-tests.tar.gz"
+            )
+            if not regression_archive.is_file():
+                raise RuntimeError("Approved regression-test archive is missing.")
+
+            regression_upload = workspace.file_upload(
+                source_path=regression_archive,
+                destination_path="/workspace/approved-regression-tests.tar.gz",
+            )
+            if not regression_upload.success:
+                raise RuntimeError(
+                    f"Could not upload approved regression tests: "
+                    f"{regression_upload.error}"
+                )
+
+            regression_helper_upload = workspace.file_upload(
+                source_path=automation_dir
+                / ".github/scripts/safe_extract_regression_tests.py",
+                destination_path="/workspace/safe_extract_regression_tests.py",
+            )
+            if not regression_helper_upload.success:
+                raise RuntimeError(
+                    f"Could not upload regression extraction helper: "
+                    f"{regression_helper_upload.error}"
+                )
+
+            regression_extract = workspace.execute_command(
+                "python /workspace/safe_extract_regression_tests.py",
+                timeout=120,
+            )
+            if regression_extract.exit_code != 0:
+                raise RuntimeError(
+                    "Approved regression-test extraction failed: "
+                    f"{regression_extract.stderr}"
+                )
+
             # Environment preparation will be handled by the
             # repository-aware dependency preparation phase.
             # Do not install repository-specific packages here.
@@ -398,13 +936,29 @@ YOUR TASK
 7. Cover normal cases, edge cases, invalid inputs, and failure cases
    where relevant.
 8. Follow the repository's existing testing conventions.
-9. Save generated tests in tests/generated/ with repository test-file
+9. Save newly generated tests in tests/generated/ with repository test-file
    conventions. Preserve existing generated tests and never overwrite them.
-   After generation, never modify, delete, rename, skip, or weaken generated tests.
+   The tests/regression/ directory contains previously approved historical
+   regression tests. Treat these tests as trusted, immutable test inputs.
+   Never modify, delete, rename, skip, weaken, or overwrite historical regression
+   tests. The complete test suite must include and execute them.
 10. Use descriptive test names.
 11. Prepare the detected complete-suite command and verify dependencies.
-    Do not run the test suite during preparation; the harness runs it and
-    supplies authoritative output for diagnosis and repair.
+    Do not run the complete repository test suite during preparation; the
+    harness runs it and supplies authoritative output for diagnosis and repair.
+    After generating tests, the harness validates newly generated tests with
+    the exact command `/workspace/.venv/bin/python -m pytest tests/generated -q`
+    before freezing the generated-test integrity snapshot. If the harness asks
+    you to correct generated tests, you may edit ONLY test files you created
+    during this session in tests/generated/ and ONLY to fix test-authoring
+    mistakes such as incorrect mocks, incorrect expected call counts, incorrect
+    assumptions, or incomplete mock responses. Never modify application code,
+    historical regression tests under tests/regression/, existing repository
+    tests, pre-existing generated tests, dependency manifests, lockfiles or
+    trusted automation. Never delete, skip, weaken or remove a failing test.
+    If a failure appears to expose a genuine application bug, preserve the test
+    unchanged and write `suspected_bugs` with the exact failing test identifier,
+    verbatim evidence and an evidence-backed reason.
 12. In response to a harness failure only, attempt no more than
     {max(0, min(int(os.getenv("MAX_REPAIR_ATTEMPTS", "2")), 3))} repairs.
     Do not edit application code during preparation or diagnosis. Only the
@@ -434,6 +988,7 @@ YOUR TASK
     single-line repository-native test command (no shebang, shell wrappers,
     operators, redirections, substitutions, installation, or network access).
     The harness validates it against project files before execution.
+{SCHEMA_HINT}
 15. Do not modify or delete existing tests.
 16. Do not overwrite existing generated tests.
 17. Do not generate tests that merely inspect this PR-testing
@@ -470,6 +1025,8 @@ Do not stop after describing the tests. Create the files.
             generated_tests_manifest = None
             generated_tests_guard = None
             generated_tests_snapshot_error = None
+            generated_test_validation = None
+            suspected_bugs = []
             original_generated_tests_manifest = None
             generated_tests_initial_integrity = None
             original_repository_tests_snapshot = Path(temp_dir) / "repository-tests-before-agent.tar.gz"
@@ -484,7 +1041,8 @@ Do not stop after describing the tests. Create the files.
                     workspace,
                     "rm -f /workspace/.openhands_environment_ready "
                     "/workspace/openhands-test-command "
-                    "/workspace/openhands-report.json",
+                    "/workspace/openhands-report.json "
+                    "/workspace/openhands-suspected-bugs.json",
                 )
                 run_checked(
                     workspace,
@@ -520,9 +1078,70 @@ Do not stop after describing the tests. Create the files.
                     agent_error = type(exc).__name__
                     conversation_error = traceback.format_exc()
 
+                # Validate newly generated tests before freezing the final
+                # integrity snapshot. Corrections are bounded to three attempts
+                # and are guarded against test/app/manifest modification.
+                def generated_validation_integrity_guard():
+                    problems = []
+                    unchanged = True
+                    if original_generated_tests_manifest is not None:
+                        generated_result = ensure_generated_tests_unchanged(
+                            workspace,
+                            original_generated_tests_snapshot,
+                            original_generated_tests_manifest,
+                            Path(temp_dir) / "generated-tests-validation.tar.gz",
+                            allow_additions=True,
+                        )
+                        unchanged = unchanged and generated_result["unchanged"]
+                        problems.extend(generated_result["errors"])
+                    if original_repository_tests_manifest is not None:
+                        repository_result = ensure_repository_tests_unchanged(
+                            workspace,
+                            original_repository_tests_snapshot,
+                            original_repository_tests_manifest,
+                            Path(temp_dir) / "repository-tests-validation.tar.gz",
+                        )
+                        unchanged = unchanged and repository_result["unchanged"]
+                        problems.extend(repository_result["errors"])
+                    app_result = sandbox_application_unchanged(workspace)
+                    unchanged = unchanged and app_result["unchanged"]
+                    if not app_result["unchanged"]:
+                        problems.append("application code changed during generated-test validation")
+                    return {
+                        "unchanged": unchanged,
+                        "errors": problems,
+                        "application_diff": app_result["output"],
+                    }
+
+                generated_test_validation = validate_generated_tests(
+                    workspace,
+                    conversation,
+                    temp_dir=temp_dir,
+                    integrity_guard=generated_validation_integrity_guard,
+                )
+                suspected_bugs = generated_test_validation.get("suspected_bugs", [])
+                if not generated_test_validation["valid"]:
+                    prefix = (
+                        "Generated-test validation failed with suspected "
+                        "application bug preserved: "
+                        if generated_test_validation.get("classification")
+                        == "suspected_application_bug"
+                        else "Generated-test validation failed: "
+                    )
+                    message = prefix + "; ".join(generated_test_validation["errors"])
+                    generated_tests_snapshot_error = (
+                        message
+                        if generated_tests_snapshot_error is None
+                        else generated_tests_snapshot_error + " " + message
+                    )
+
                 # Existing generated tests are immutable; new tests may be
-                # added only if the pre-existing snapshot still matches.
-                if original_generated_tests_manifest is not None:
+                # added only if validation succeeded and the pre-existing
+                # snapshot still matches.
+                if (
+                    original_generated_tests_manifest is not None
+                    and generated_tests_snapshot_error is None
+                ):
                     generated_tests_initial_integrity = ensure_generated_tests_unchanged(
                         workspace,
                         original_generated_tests_snapshot,
@@ -766,6 +1385,15 @@ Do not stop after describing the tests. Create the files.
                 }, indent=2), encoding="utf-8")
 
             report_path = output_dir / "openhands-report.json"
+            report_path = output_dir / "openhands-report.json"
+            try:
+                report_text = report_path.read_text(encoding="utf-8")
+                report_path.write_text(
+                    normalize_final_agent_report(report_text, attempt_records),
+                    encoding="utf-8",
+                )
+            except (OSError, UnicodeError):
+                pass
             report = load_agent_report(report_path, attempt_records)
             diagnosis_gate_by_attempt = {
                 item.get("attempt"): item
@@ -814,12 +1442,46 @@ Do not stop after describing the tests. Create the files.
                 report["blockers"].append(
                     "Runtime/dependency preparation was not verified by the harness."
                 )
+            (
+                final_failure_category_value,
+                workflow_failure_category_value,
+            ) = report_failure_categories(
+                report, attempt_records, environment_ready
+            )
             report.update({
                 "pr_number": pr_number,
                 "base_sha": base_sha,
                 "head_sha": head_sha,
                 "sandbox_image": server_image,
                 "harness_attempts": attempt_records,
+                "suspected_bugs": suspected_bugs,
+                "quarantined_tests": quarantined_tests_from_attempts(attempt_records),
+                "generated_test_validation": {
+                    "valid": bool(
+                        generated_test_validation
+                        and generated_test_validation["valid"]
+                    ),
+                    "attempts": (
+                        generated_test_validation.get("attempts")
+                        if generated_test_validation else None
+                    ),
+                    "classification": (
+                        generated_test_validation.get("classification")
+                        if generated_test_validation else None
+                    ),
+                    "results": (
+                        generated_test_validation.get("results", [])
+                        if generated_test_validation else []
+                    ),
+                    "guard_checks": (
+                        generated_test_validation.get("guard_checks", [])
+                        if generated_test_validation else []
+                    ),
+                    "errors": (
+                        generated_test_validation.get("errors", [])
+                        if generated_test_validation else []
+                    ),
+                },
                 "result": "passed" if test_result.exit_code == 0 else "failed",
                 "harness_result": "passed" if test_result.exit_code == 0 else "failed",
                 "report_valid": report_valid and patch_capture_valid,
@@ -827,9 +1489,8 @@ Do not stop after describing the tests. Create the files.
                 "harness_final_exit_code": test_result.exit_code,
                 "environment_ready": environment_ready,
                 "validated_test_command": validated_command,
-                "final_failure_category": final_failure_category(
-                    report, attempt_records, environment_ready
-                ),
+                "final_failure_category": final_failure_category_value,
+                "workflow_failure_category": workflow_failure_category_value,
                 "runner_error": agent_error,
                 "conversation_error": conversation_error,
                 "verified_test_results": [
@@ -882,6 +1543,7 @@ Do not stop after describing the tests. Create the files.
                 "final_exit_code": test_result.exit_code,
                 "validated_test_command": validated_command,
                 "environment_ready": environment_ready,
+                "quarantined_tests": quarantined_tests_from_attempts(attempt_records),
                 "attempts": attempt_records,
                 "final_stdout": test_result.stdout or "",
                 "final_stderr": test_result.stderr or "",
@@ -968,24 +1630,18 @@ Do not stop after describing the tests. Create the files.
             print("\nGenerated tests retrieved from Docker sandbox.")
 
             # Publish results in GitHub Actions job summary.
-            summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-
-            if summary_path:
-                with open(summary_path, "a", encoding="utf-8") as summary:
-                    summary.write(
-                        f"## OpenHands PR Test Report\n\n"
-                        f"- PR: #{pr_number}\n"
-                        f"- Base: `{base_sha}`\n"
-                        f"- Head: `{head_sha}`\n"
-                        f"- Sandbox: `{server_image}`\n"
-                        f"- Result: {'PASSED' if test_result.exit_code == 0 else 'FAILED'}\n"
-                        f"- Failure category: {report['final_failure_category'] or 'none'}\n"
-                        f"- Attempts: {len(attempt_records)}\n\n"
-                        f"- Agent report valid: {'yes' if report['report_valid'] else 'no'}\n\n"
-                        f"### Repository test results\n\n"
-                        f"```text\n{test_result.stdout or ''}\n{test_result.stderr or ''}\n```\n\n"
-                        f"Machine-readable report and patches: `openhands-report.json` artifact.\n"
-                    )
+            write_summary_text(
+                os.getenv("GITHUB_STEP_SUMMARY"),
+                normal_summary_text(
+                    pr_number,
+                    base_sha,
+                    head_sha,
+                    server_image,
+                    test_result,
+                    attempt_records,
+                    report,
+                ),
+            )
 
             if test_result.exit_code != 0:
                 raise RuntimeError(
@@ -1013,14 +1669,13 @@ def main():
             type(exc).__name__,
             traceback.format_exc(),
         )
-        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-        if summary_path:
-            with open(summary_path, "a", encoding="utf-8") as summary:
-                summary.write(
-                    "\n## OpenHands PR Test Report\n\n"
-                    f"- Result: Failed before verified completion ({type(exc).__name__}).\n"
-                    "- A failure report and generated-tests artifact were retained.\n"
-                )
+        final_category, workflow_category = fallback_report_categories(output_dir)
+        write_summary_text(
+            os.getenv("GITHUB_STEP_SUMMARY"),
+            fallback_summary_text(
+                type(exc).__name__, final_category, workflow_category
+            ),
+        )
         raise
 
 
