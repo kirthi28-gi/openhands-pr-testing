@@ -307,7 +307,19 @@ def test_full_generator_pipeline_never_sends_private_corpus_to_sandbox(
             "restored": False,
         }
 
+    events = []
+
     monkeypatch.setattr(gt, "block_embedded_dns", lambda *a, **k: None)
+    monkeypatch.setattr(
+        gt,
+        "install_verification_dependencies",
+        lambda *a, **k: events.append("install"),
+    )
+    monkeypatch.setattr(
+        gt,
+        "preflight_verification_imports",
+        lambda *a, **k: events.append("preflight"),
+    )
     monkeypatch.setattr(gt, "get_changed_files", lambda *a, **k: ["app.py"])
     monkeypatch.setattr(gt, "LLM", lambda **k: SimpleNamespace())
     monkeypatch.setattr(gt, "get_default_agent", lambda **k: SimpleNamespace())
@@ -319,7 +331,7 @@ def test_full_generator_pipeline_never_sends_private_corpus_to_sandbox(
     monkeypatch.setattr(
         gt,
         "validate_generated_tests",
-        lambda *a, **k: {
+        lambda *a, **k: events.append("generated_validation") or {
             "valid": True,
             "suspected_bugs": [],
             "classification": "passed",
@@ -332,7 +344,7 @@ def test_full_generator_pipeline_never_sends_private_corpus_to_sandbox(
     monkeypatch.setattr(
         gt,
         "verify_test_environment",
-        lambda *a, **k: {
+        lambda *a, **k: events.append("verify") or {
             "ready": True,
             "failures": [],
             "blockers": [],
@@ -344,7 +356,7 @@ def test_full_generator_pipeline_never_sends_private_corpus_to_sandbox(
     monkeypatch.setattr(
         gt,
         "run_repair_loop",
-        lambda *a, **k: (
+        lambda *a, **k: events.append("repair") or (
             SimpleNamespace(exit_code=0, stdout="1 passed", stderr=""),
             attempt_records,
         ),
@@ -385,3 +397,13 @@ def test_full_generator_pipeline_never_sends_private_corpus_to_sandbox(
     assert regression_dummy not in forwarded
     assert "GITHUB_TOKEN" not in forwarded
     assert "REGRESSION_TESTS_TOKEN" not in forwarded
+
+    # Dependency install and import preflight happen before any pytest
+    # validation, collection, or suite execution in the real _main() flow.
+    assert events == [
+        "install",
+        "preflight",
+        "generated_validation",
+        "verify",
+        "repair",
+    ]

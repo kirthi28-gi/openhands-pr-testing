@@ -455,6 +455,8 @@ def test_normal_execution_path_writes_categories_to_summary(tmp_path, monkeypatc
         }
 
     monkeypatch.setattr(gt, "block_embedded_dns", lambda *a, **k: None)
+    monkeypatch.setattr(gt, "install_verification_dependencies", lambda *a, **k: None)
+    monkeypatch.setattr(gt, "preflight_verification_imports", lambda *a, **k: None)
     monkeypatch.setattr(gt, "get_changed_files", lambda *a, **k: ["app.py"])
     monkeypatch.setattr(gt, "LLM", lambda **k: SimpleNamespace())
     monkeypatch.setattr(gt, "get_default_agent", lambda **k: SimpleNamespace())

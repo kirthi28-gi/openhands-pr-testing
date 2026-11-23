@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".github/scripts"))
 
 import generate_tests as gt  # noqa: E402
 import package_proxy as proxy  # noqa: E402
+import pr_test_harness as harness  # noqa: E402
 import sandbox_network as sn  # noqa: E402
 
 
@@ -406,6 +407,169 @@ def test_proxy_rejects_oversized_request_over_real_socket():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_install_verification_dependencies_uses_trusted_requirements_file(tmp_path):
+    automation = tmp_path / "trusted"
+    automation.mkdir()
+    requirements = automation / "requirements-dev.txt"
+    requirements.write_text("pytest\n", encoding="utf-8")
+    commands = []
+    uploads = []
+
+    class Workspace:
+        def file_upload(self, source_path, destination_path):
+            uploads.append((Path(source_path), destination_path))
+            return SimpleNamespace(success=True, error=None)
+
+        def execute_command(self, command, timeout=600):
+            commands.append((command, timeout))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    gt.install_verification_dependencies(Workspace(), automation)
+
+    assert uploads == [(requirements, gt.VERIFICATION_REQUIREMENTS_FILE)]
+    assert commands[0][0].startswith(f"test -x {gt.VERIFICATION_PYTHON}")
+    pip_command = commands[1][0]
+    assert pip_command.startswith(f"{gt.VERIFICATION_PYTHON} -m pip install")
+    assert f"-r {gt.VERIFICATION_REQUIREMENTS_FILE}" in pip_command
+    repo_requirements = (
+        Path(__file__).resolve().parents[1] / "requirements-dev.txt"
+    ).read_text(encoding="utf-8").splitlines()
+    assert "pydantic>=2.13.5,<3" in repo_requirements
+    assert "openhands-sdk==1.59.0" in repo_requirements
+
+
+def test_generator_has_no_duplicated_dependency_pins():
+    source = (
+        Path(__file__).resolve().parents[1] / ".github/scripts/generate_tests.py"
+    ).read_text(encoding="utf-8")
+
+    for pin in (
+        "pydantic>=",
+        "openhands-sdk==",
+        "openhands-tools==",
+        "openhands-workspace==",
+    ):
+        assert pin not in source
+
+
+def test_install_verification_dependencies_fails_when_interpreter_missing(tmp_path):
+    automation = tmp_path / "trusted"
+    automation.mkdir()
+    (automation / "requirements-dev.txt").write_text("pytest\n", encoding="utf-8")
+
+    class Workspace:
+        def file_upload(self, source_path, destination_path):
+            return SimpleNamespace(success=True, error=None)
+
+        def execute_command(self, command, timeout=600):
+            return SimpleNamespace(exit_code=1, stdout="", stderr="missing")
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        gt.install_verification_dependencies(Workspace(), automation)
+
+
+def test_preflight_verification_imports_fails_closed():
+    commands = []
+
+    class Workspace:
+        def execute_command(self, command, timeout=600):
+            commands.append(command)
+            return SimpleNamespace(
+                exit_code=1,
+                stdout="import errors: pydantic: ModuleNotFoundError: No module named 'pydantic'",
+                stderr="",
+            )
+
+    with pytest.raises(RuntimeError, match="dependency preflight failed") as exc:
+        gt.preflight_verification_imports(Workspace())
+
+    assert "pydantic: ModuleNotFoundError" in str(exc.value)
+    assert commands[0].startswith(f"{gt.VERIFICATION_PYTHON} -c ")
+    assert "import_module" in commands[0]
+
+
+def test_preflight_reports_missing_transitive_import_clearly():
+    detail = (
+        "import errors: openhands.sdk: ModuleNotFoundError: No module named 'litellm'"
+    )
+
+    class Workspace:
+        def execute_command(self, command, timeout=600):
+            return SimpleNamespace(exit_code=1, stdout=detail, stderr="")
+
+    with pytest.raises(RuntimeError) as exc:
+        gt.preflight_verification_imports(Workspace())
+
+    assert "litellm" in str(exc.value)
+    assert "openhands.sdk" in str(exc.value)
+
+
+def _verification_workspace(imports_ok: bool):
+    class Workspace:
+        def execute_command(self, command, timeout=600):
+            if "find_spec('pip')" in command:
+                return SimpleNamespace(exit_code=0, stdout="available", stderr="")
+            if "importlib,json" in command:
+                stdout = (
+                    "imports ok"
+                    if imports_ok
+                    else "import errors: pydantic: ModuleNotFoundError: No module named 'pydantic'"
+                )
+                return SimpleNamespace(
+                    exit_code=0 if imports_ok else 1, stdout=stdout, stderr=""
+                )
+            if "--collect-only" in command:
+                return SimpleNamespace(
+                    exit_code=0, stdout="tests/test_x.py::test_ok", stderr=""
+                )
+            if "--version" in command:
+                stdout = "pytest 9.2.0" if "pytest" in command else "Python 3.12.16"
+                return SimpleNamespace(exit_code=0, stdout=stdout, stderr="")
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    return Workspace()
+
+
+def test_verify_environment_requires_trusted_imports(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_x.py").write_text("def test_ok(): pass\n")
+    (tmp_path / "requirements-dev.txt").write_text("pytest\n")
+
+    result = harness.verify_test_environment(
+        _verification_workspace(True),
+        tmp_path,
+        "/workspace/.venv/bin/python -m pytest -q",
+    )
+
+    assert result["ready"] is True
+    import_check = [
+        check for check in result["checks"]
+        if check["name"] == "python_trusted_dependency_imports"
+    ]
+    assert len(import_check) == 1
+    assert import_check[0]["passed"] is True
+
+    check_names = [check["name"] for check in result["checks"]]
+    assert check_names.index("python_trusted_dependency_imports") < check_names.index(
+        "python_test_collection"
+    )
+
+    failed = harness.verify_test_environment(
+        _verification_workspace(False),
+        tmp_path,
+        "/workspace/.venv/bin/python -m pytest -q",
+    )
+    assert failed["ready"] is False
+    import_failures = [
+        check for check in failed["checks"]
+        if check["name"] == "python_trusted_dependency_imports"
+        and check["passed"] is False
+    ]
+    assert len(import_failures) == 1
+    assert "ModuleNotFoundError" in import_failures[0]["output"]
+    assert "pydantic" in import_failures[0]["output"]
 
 
 def test_resolve_public_rejects_any_private_answer(monkeypatch):

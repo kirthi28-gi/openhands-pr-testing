@@ -93,6 +93,33 @@ def diagnosis_prompt_with_schema_hint(message: str) -> str:
     return message
 
 
+VERIFICATION_IMPORT_MODULES = (
+    "pydantic",
+    "openhands.sdk",
+    "openhands.tools",
+    "openhands.tools.preset.default",
+    "openhands.workspace",
+)
+
+
+def verification_import_probe() -> str:
+    """Return code that actually imports every trusted verification module."""
+    return (
+        "import importlib,json; "
+        f"names=json.loads({json.dumps(list(VERIFICATION_IMPORT_MODULES))}); "
+        "errors=[]\n"
+        "for name in names:\n"
+        " try:\n"
+        "  importlib.import_module(name)\n"
+        " except Exception as exc:\n"
+        "  errors.append(name+': '+type(exc).__name__+': '+str(exc))\n"
+        "print('import errors: '+'; '.join(errors) if errors else 'imports ok')\n"
+        "raise SystemExit(1 if errors else 0)"
+    )
+
+
+VERIFICATION_IMPORT_PROBE = verification_import_probe()
+
 SUPPORTED_PACKAGE_MANAGERS = {"pip", "poetry", "uv", "pipenv"}
 UNSUPPORTED_PACKAGE_MANAGERS = {"conda", "pdm", "pixi", "flit", "hatch"}
 
@@ -841,6 +868,10 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
             pip_check = check("python_dependency_consistency", [*wrapper, interpreter, "-m", "pip", "check"])
         else:
             limitations.append("pip is unavailable in the selected Python environment; dependency consistency relies on imports during collection.")
+        imports_ok = check(
+            "python_trusted_dependency_imports",
+            [*wrapper, interpreter, "-c", VERIFICATION_IMPORT_PROBE],
+        )
         if framework == "pytest":
             collection_ok = check_collection("python_test_collection", [*wrapper, *runner, "--collect-only", "-q"])
         else:
@@ -850,7 +881,10 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
                 "raise SystemExit(0 if count else 5)"
             )
             collection_ok = check_collection("python_test_collection", [*wrapper, interpreter, "-c", discovery])
-        required_ok = runtime_ok and runner_ok and pip_probe and (pip_check or not pip_available) and collection_ok
+        required_ok = (
+            runtime_ok and runner_ok and pip_probe
+            and (pip_check or not pip_available) and imports_ok and collection_ok
+        )
     elif tokens[0] in {"npm", "pnpm", "yarn"}:
         ecosystem = "javascript"
         manager = tokens[0]

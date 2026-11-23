@@ -1,1 +1,5 @@
 pytest
+pydantic>=2.13.5,<3
+openhands-sdk==1.59.0
+openhands-tools==1.59.0
+openhands-workspace==1.59.0

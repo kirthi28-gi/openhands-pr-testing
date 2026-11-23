@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shlex
 import platform
 import shutil
 import subprocess
@@ -41,6 +42,7 @@ from pr_test_harness import (
     update_validation_marker,
     validate_test_command,
     verify_test_environment,
+    verification_import_probe,
     workflow_failure_category,
 )
 
@@ -163,6 +165,59 @@ def validate_regression_corpus_archive(archive_path: Path) -> dict:
         result["errors"].append(f"{type(exc).__name__}: {exc}")
     result["valid"] = not result["errors"]
     return result
+
+
+VERIFICATION_PYTHON = "/workspace/.venv/bin/python"
+VERIFICATION_REQUIREMENTS_FILE = "/workspace/openhands-verification-requirements.txt"
+
+
+def install_verification_dependencies(workspace, automation_dir: Path) -> None:
+    """Install trusted requirements into the pytest interpreter.
+
+    requirements-dev.txt on the trusted host is the single source of truth.
+    It is uploaded to the sandbox rather than read from PR-controlled source.
+    """
+    requirements_source = automation_dir / "requirements-dev.txt"
+    if not requirements_source.is_file():
+        raise RuntimeError(
+            f"Trusted requirements file is missing: {requirements_source}"
+        )
+    upload = workspace.file_upload(
+        source_path=requirements_source,
+        destination_path=VERIFICATION_REQUIREMENTS_FILE,
+    )
+    if not upload.success:
+        raise RuntimeError(
+            f"Could not upload trusted verification requirements: {upload.error}"
+        )
+
+    interpreter_check = workspace.execute_command(f"test -x {VERIFICATION_PYTHON}")
+    if interpreter_check.exit_code != 0:
+        raise RuntimeError(
+            f"Verification interpreter {VERIFICATION_PYTHON} is unavailable; "
+            "repository environment preparation did not create it."
+        )
+    command = (
+        f"{VERIFICATION_PYTHON} -m pip install "
+        f"-r {shlex.quote(VERIFICATION_REQUIREMENTS_FILE)}"
+    )
+    result = workspace.execute_command(command, timeout=600)
+    if result.exit_code != 0:
+        raise RuntimeError(
+            "Could not install trusted verification dependencies into "
+            f"{VERIFICATION_PYTHON}: {(result.stderr or result.stdout or '').strip()}"
+        )
+
+
+def preflight_verification_imports(workspace) -> None:
+    """Verify the same interpreter used by pytest can import trusted scripts."""
+    command = f"{VERIFICATION_PYTHON} -c {shlex.quote(verification_import_probe())}"
+    result = workspace.execute_command(command)
+    if result.exit_code != 0:
+        raise RuntimeError(
+            "Trusted verification dependency preflight failed: "
+            f"{(result.stdout or result.stderr or '').strip()}"
+        )
 
 
 DNS_QUERY_HEX = "1234010000010000000000000470797069036f72670000010001"
@@ -1232,6 +1287,12 @@ Do not stop after describing the tests. Create the files.
                 except Exception as exc:
                     agent_error = type(exc).__name__
                     conversation_error = traceback.format_exc()
+
+                # Install and verify the imports required by the trusted
+                # scripts that repository and generated tests import. This
+                # must happen before validation, collection, or suite execution.
+                install_verification_dependencies(workspace, automation_dir)
+                preflight_verification_imports(workspace)
 
                 # Validate newly generated tests before freezing the final
                 # integrity snapshot. Corrections are bounded to three attempts
