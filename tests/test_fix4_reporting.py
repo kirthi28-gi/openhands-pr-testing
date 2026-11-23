@@ -1,7 +1,9 @@
 """Focused tests for Fix 4 reporting categories."""
 
+import io
 import json
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -339,7 +341,19 @@ def test_normal_execution_path_writes_categories_to_summary(tmp_path, monkeypatc
     source.mkdir()
     regression_input = automation / "regression-input"
     regression_input.mkdir()
-    (regression_input / "approved-regression-tests.tar.gz").write_bytes(b"archive")
+    corpus_archive = regression_input / "approved-regression-tests.tar.gz"
+    with tarfile.open(corpus_archive, "w:gz") as archive:
+        directory = tarfile.TarInfo("tests/regression/")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        directory.size = 0
+        archive.addfile(directory)
+        payload = b"def test_ok(): pass\n"
+        member = tarfile.TarInfo("tests/regression/PR-19/test_ok.py")
+        member.type = tarfile.REGTYPE
+        member.mode = 0o644
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
     scripts = automation / ".github/scripts"
     scripts.mkdir(parents=True)
     (scripts / "safe_extract_regression_tests.py").write_text("# helper\n", encoding="utf-8")
@@ -349,6 +363,7 @@ def test_normal_execution_path_writes_categories_to_summary(tmp_path, monkeypatc
 
     for name, value in {
         "AUTOMATION_DIR": str(automation),
+        "OH_SANDBOX_NETWORK": "oh-pr-sandbox-test",
         "PR_SOURCE_DIR": str(source),
         "PR_DIFF_FILE": str(diff_file),
         "PR_NUMBER": "19",
@@ -439,6 +454,7 @@ def test_normal_execution_path_writes_categories_to_summary(tmp_path, monkeypatc
             "restored": False,
         }
 
+    monkeypatch.setattr(gt, "block_embedded_dns", lambda *a, **k: None)
     monkeypatch.setattr(gt, "get_changed_files", lambda *a, **k: ["app.py"])
     monkeypatch.setattr(gt, "LLM", lambda **k: SimpleNamespace())
     monkeypatch.setattr(gt, "get_default_agent", lambda **k: SimpleNamespace())

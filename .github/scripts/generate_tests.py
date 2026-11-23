@@ -53,11 +53,214 @@ from openhands.tools.preset.default import get_default_agent
 from openhands.workspace import DockerWorkspace
 
 
+# The untrusted sandbox needs only the agent-server session keys. No LLM,
+# GitHub, or regression-corpus credentials are ever forwarded into it.
+UNTRUSTED_FORWARD_ENV = [
+    "SESSION_API_KEY",
+    "OH_SESSION_API_KEYS_0",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+]
+SANDBOX_PROXY_SOURCE_ENV = {
+    "HTTP_PROXY": "SANDBOX_HTTP_PROXY",
+    "HTTPS_PROXY": "SANDBOX_HTTPS_PROXY",
+    "NO_PROXY": "SANDBOX_NO_PROXY",
+}
+
+
+def take_sandbox_proxy_env() -> tuple[dict[str, str], dict[str, str | None]]:
+    """Remove sandbox proxy variables and preserve any host originals."""
+    values = {}
+    originals = {}
+    for target, source in SANDBOX_PROXY_SOURCE_ENV.items():
+        original = os.environ.pop(target, None)
+        sandbox_value = os.environ.pop(source, None)
+        originals[target] = original
+        if sandbox_value is not None:
+            values[target] = sandbox_value
+    return values, originals
+
+
+def expose_sandbox_proxy_env(values: dict[str, str]) -> None:
+    for name, value in values.items():
+        os.environ[name] = value
+
+
+def restore_sandbox_proxy_env(originals: dict[str, str | None]) -> None:
+    for name, value in originals.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 GENERATED_TEST_VALIDATION_COMMAND = (
     "/workspace/.venv/bin/python -m pytest tests/generated -q"
 )
 MAX_GENERATED_TEST_VALIDATION_ATTEMPTS = 3
 SUSPECTED_BUGS_REPORT = "openhands-suspected-bugs.json"
+
+def validate_regression_corpus_archive(archive_path: Path) -> dict:
+    """Structurally validate the private corpus on the trusted host.
+
+    This never imports or executes corpus contents. Python test files are
+    syntax-compiled only; no application code is loaded.
+    """
+    result = {
+        "valid": False,
+        "members": 0,
+        "python_files_compiled": 0,
+        "errors": [],
+        "executed_against_pr_code": False,
+    }
+    try:
+        candidate = Path(archive_path)
+        if candidate.is_symlink() or not candidate.is_file():
+            raise RuntimeError("Approved regression-test archive is missing or unsafe")
+        with tarfile.open(candidate.resolve(), "r:gz") as archive:
+            members = archive.getmembers()
+            if not members:
+                raise RuntimeError("Approved regression-test archive is empty")
+            result["members"] = len(members)
+            root_found = False
+            for member in members:
+                name = member.name
+                normalized = name[:-1] if name.endswith("/") else name
+                parts = normalized.split("/")
+                if (
+                    not name
+                    or "\\" in name
+                    or name.startswith("/")
+                    or any(part in ("", ".", "..") for part in parts)
+                    or parts[:2] != ["tests", "regression"]
+                ):
+                    raise RuntimeError(f"Unsafe regression path: {name}")
+                if tuple(parts) == ("tests", "regression"):
+                    if not member.isdir():
+                        raise RuntimeError("Regression root must be a directory")
+                    root_found = True
+                if member.isdir():
+                    if member.size != 0:
+                        raise RuntimeError(f"Invalid directory entry: {name}")
+                    continue
+                if not member.isfile():
+                    raise RuntimeError(f"Unsupported archive entry: {name}")
+                if member.size <= 0:
+                    raise RuntimeError(f"Empty regression test: {name}")
+                payload = archive.extractfile(member)
+                if payload is None:
+                    raise RuntimeError(f"Could not read archive entry: {name}")
+                data = payload.read()
+                if b"\0" in data:
+                    raise RuntimeError(f"Binary regression test is not allowed: {name}")
+                if name.endswith(".py"):
+                    compile(data.decode("utf-8"), name, "exec")
+                    result["python_files_compiled"] += 1
+            if not root_found:
+                raise RuntimeError("Approved regression-test archive has no root")
+    except Exception as exc:
+        result["errors"].append(f"{type(exc).__name__}: {exc}")
+    result["valid"] = not result["errors"]
+    return result
+
+
+DNS_QUERY_HEX = "1234010000010000000000000470797069036f72670000010001"
+DNS_UDP_PROBE_COMMAND = (
+    "python -c 'import socket,sys; "
+    "s=socket.socket(2,2); s.settimeout(1); "
+    f"s.sendto(bytes.fromhex(\"{DNS_QUERY_HEX}\"),(\"127.0.0.11\",53));\n"
+    "try:\n"
+    " s.recvfrom(512); sys.exit(1)\n"
+    "except (socket.timeout, OSError):\n"
+    " sys.exit(0)'"
+)
+DNS_TCP_PROBE_COMMAND = (
+    "python -c 'import socket,sys; "
+    f"q=bytes.fromhex(\"{DNS_QUERY_HEX}\");\n"
+    "try:\n"
+    " s=socket.create_connection((\"127.0.0.11\",53),timeout=1); "
+    "s.sendall(len(q).to_bytes(2,\"big\")+q); s.recv(512); sys.exit(1)\n"
+    "except (socket.timeout, OSError):\n"
+    " sys.exit(0)'"
+)
+
+
+def resolve_container_id(workspace) -> str:
+    """Resolve the sandbox container id from known workspace attributes."""
+    for attribute in ("_container_id", "container_id"):
+        value = getattr(workspace, attribute, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise RuntimeError(
+        "Sandbox container id is unavailable for DNS isolation "
+        "(_container_id/container_id not found)"
+    )
+
+
+def block_embedded_dns(workspace) -> None:
+    """Block Docker embedded DNS inside the sandbox network namespace.
+
+    The rules are installed from the trusted host with nsenter; the untrusted
+    container is not granted NET_ADMIN. A runtime probe verifies the block.
+    """
+    container_id = resolve_container_id(workspace)
+
+    inspected = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Pid}}", str(container_id)],
+        check=True, capture_output=True, text=True,
+    )
+    pid = inspected.stdout.strip()
+    if not pid.isdigit():
+        raise RuntimeError("Could not resolve sandbox container PID")
+
+    for protocol in ("udp", "tcp"):
+        subprocess.run([
+            "sudo", "nsenter", "-t", pid, "-n",
+            "iptables", "-A", "OUTPUT",
+            "-d", "127.0.0.11/32", "-p", protocol, "--dport", "53",
+            "-j", "DROP",
+        ], check=True, capture_output=True, text=True)
+        subprocess.run([
+            "sudo", "nsenter", "-t", pid, "-n",
+            "ip6tables", "-A", "OUTPUT",
+            "-d", "::1/128", "-p", protocol, "--dport", "53",
+            "-j", "DROP",
+        ], check=True, capture_output=True, text=True)
+
+    for name, command in (
+        ("UDP", DNS_UDP_PROBE_COMMAND),
+        ("TCP", DNS_TCP_PROBE_COMMAND),
+    ):
+        probe = workspace.execute_command(command)
+        if probe.exit_code != 0:
+            raise RuntimeError(
+                f"Embedded {name} DNS is still reachable inside the sandbox"
+            )
+
+
+def upload_pr_source_to_workspace(workspace, archive_path: Path, automation_dir: Path) -> None:
+    """Upload only PR source and its extractor into the untrusted workspace."""
+    upload = workspace.file_upload(
+        source_path=archive_path,
+        destination_path="/workspace/pr-repository.tar.gz",
+    )
+    if not upload.success:
+        raise RuntimeError(f"Could not upload PR source: {upload.error}")
+
+    helper_upload = workspace.file_upload(
+        source_path=automation_dir / ".github/scripts/safe_extract.py",
+        destination_path="/workspace/safe_extract.py",
+    )
+    if not helper_upload.success:
+        raise RuntimeError(f"Could not upload extraction helper: {helper_upload.error}")
+
+    extraction = workspace.execute_command("python /workspace/safe_extract.py")
+    if extraction.exit_code != 0:
+        raise RuntimeError(
+            f"Safe PR source extraction failed: {extraction.stderr}"
+        )
+
 
 def report_failure_categories(report: dict, attempt_records: list, environment_ready: bool):
     """Return the final and workflow failure categories from one source."""
@@ -98,7 +301,9 @@ def normal_summary_text(
         f"- Failure category: {report['final_failure_category'] or 'none'}\n"
         f"- Workflow failure category: {report['workflow_failure_category'] or 'none'}\n"
         f"- Attempts: {len(attempt_records)}\n\n"
-        f"- Agent report valid: {'yes' if report['report_valid'] else 'no'}\n\n"
+        f"- Agent report valid: {'yes' if report['report_valid'] else 'no'}\n"
+        f"- Private regression corpus: "
+        f"{'structure-validated on trusted host; NOT executed against PR code' if report.get('regression_corpus', {}).get('valid') else 'not validated'}\n\n"
         f"### Repository test results\n\n"
         f"```text\n{test_result.stdout or ''}\n{test_result.stderr or ''}\n```\n\n"
         f"Machine-readable report and patches: `openhands-report.json` artifact.\n"
@@ -612,6 +817,7 @@ def _main():
     automation_dir = Path(os.environ["AUTOMATION_DIR"]).resolve()
     repo_path = Path(os.environ["PR_SOURCE_DIR"]).resolve()
     diff_path = Path(os.environ["PR_DIFF_FILE"]).resolve()
+    sandbox_proxy_env, original_proxy_env = take_sandbox_proxy_env()
 
     output_dir = automation_dir / "generated-tests"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -694,6 +900,18 @@ def _main():
         "ghcr.io/openhands/agent-server:latest-python",
     )
 
+    # Trusted-host-only: validate the private corpus without ever placing it
+    # in the untrusted workspace or importing PR-controlled application code.
+    regression_archive = (
+        automation_dir / "regression-input" / "approved-regression-tests.tar.gz"
+    )
+    regression_corpus = validate_regression_corpus_archive(regression_archive)
+    if not regression_corpus["valid"]:
+        raise RuntimeError(
+            "Approved regression-test corpus failed structure validation: "
+            + "; ".join(regression_corpus["errors"])
+        )
+
     with tempfile.TemporaryDirectory() as temp_dir:
         archive_path = Path(temp_dir) / "pr-repository.tar.gz"
 
@@ -703,82 +921,38 @@ def _main():
             archive_path,
         )
 
+        sandbox_network = os.getenv("OH_SANDBOX_NETWORK")
+        if not sandbox_network:
+            raise RuntimeError(
+                "OH_SANDBOX_NETWORK is required; refusing to create an "
+                "unrestricted sandbox network."
+            )
+
         print("Starting OpenHands Docker sandbox...")
 
-        with DockerWorkspace(
-            server_image=server_image,
-            platform=docker_platform,
-            network="bridge",
-            forward_env=["SESSION_API_KEY", "OH_SESSION_API_KEYS_0"],
-        ) as workspace:
+        # DockerWorkspace copies forward_env from the host process environment
+        # at construction time. Expose proxy variables only for that moment so
+        # the host-side LLM client never uses the package proxy.
+        expose_sandbox_proxy_env(sandbox_proxy_env)
+        try:
+            workspace_manager = DockerWorkspace(
+                server_image=server_image,
+                platform=docker_platform,
+                network=sandbox_network,
+                forward_env=UNTRUSTED_FORWARD_ENV,
+            )
+        finally:
+            restore_sandbox_proxy_env(original_proxy_env)
+
+        with workspace_manager as workspace:
+            block_embedded_dns(workspace)
 
             # Transfer PR source code into the isolated workspace.
-            upload = workspace.file_upload(
-                source_path=archive_path,
-                destination_path="/workspace/pr-repository.tar.gz",
-            )
+            upload_pr_source_to_workspace(workspace, archive_path, automation_dir)
 
-            if not upload.success:
-                raise RuntimeError(
-                    f"Could not upload PR source: {upload.error}"
-                )
-
-            helper_upload = workspace.file_upload(
-                source_path=automation_dir / ".github/scripts/safe_extract.py",
-                destination_path="/workspace/safe_extract.py",
-            )
-            if not helper_upload.success:
-                raise RuntimeError(
-                    f"Could not upload extraction helper: {helper_upload.error}"
-                )
-
-            upload = workspace.execute_command(
-                "python /workspace/safe_extract.py"
-            )
-            if upload.exit_code != 0:
-                raise RuntimeError(
-                    f"Safe PR source extraction failed: {upload.stderr}"
-                )
-
-            # Transfer approved regression tests from the trusted runner.
-            regression_archive = (
-                automation_dir
-                / "regression-input"
-                / "approved-regression-tests.tar.gz"
-            )
-            if not regression_archive.is_file():
-                raise RuntimeError("Approved regression-test archive is missing.")
-
-            regression_upload = workspace.file_upload(
-                source_path=regression_archive,
-                destination_path="/workspace/approved-regression-tests.tar.gz",
-            )
-            if not regression_upload.success:
-                raise RuntimeError(
-                    f"Could not upload approved regression tests: "
-                    f"{regression_upload.error}"
-                )
-
-            regression_helper_upload = workspace.file_upload(
-                source_path=automation_dir
-                / ".github/scripts/safe_extract_regression_tests.py",
-                destination_path="/workspace/safe_extract_regression_tests.py",
-            )
-            if not regression_helper_upload.success:
-                raise RuntimeError(
-                    f"Could not upload regression extraction helper: "
-                    f"{regression_helper_upload.error}"
-                )
-
-            regression_extract = workspace.execute_command(
-                "python /workspace/safe_extract_regression_tests.py",
-                timeout=120,
-            )
-            if regression_extract.exit_code != 0:
-                raise RuntimeError(
-                    "Approved regression-test extraction failed: "
-                    f"{regression_extract.stderr}"
-                )
+            # The private regression corpus is never uploaded to this
+            # untrusted workspace. It is validated on the trusted host above
+            # and is not executed against PR code in this workflow.
 
             # Environment preparation will be handled by the
             # repository-aware dependency preparation phase.
@@ -912,10 +1086,12 @@ YOUR TASK
 8. Follow the repository's existing testing conventions.
 9. Save newly generated tests in tests/generated/ with repository test-file
    conventions. Preserve existing generated tests and never overwrite them.
-   The tests/regression/ directory contains previously approved historical
-   regression tests. Treat these tests as trusted, immutable test inputs.
-   Never modify, delete, rename, skip, weaken, or overwrite historical regression
-   tests. The complete test suite must include and execute them.
+   Private approved regression tests are held outside this untrusted workspace.
+   The harness validates their structure on the trusted host; they are NOT
+   executed against PR code in this workflow and are not available here.
+   Never create, modify, import, copy, or include a tests/regression/ directory
+   or any regression archive in your test command. Do not weaken or delete
+   existing tests.
 10. Use descriptive test names.
 11. Prepare the detected complete-suite command and verify dependencies.
     Do not run the complete repository test suite during preparation; the
@@ -927,9 +1103,9 @@ YOUR TASK
     during this session in tests/generated/ and ONLY to fix test-authoring
     mistakes such as incorrect mocks, incorrect expected call counts, incorrect
     assumptions, or incomplete mock responses. Never modify application code,
-    historical regression tests under tests/regression/, existing repository
-    tests, pre-existing generated tests, dependency manifests, lockfiles or
-    trusted automation. Never delete, skip, weaken or remove a failing test.
+    any regression-test paths, existing repository tests, pre-existing generated
+    tests, dependency manifests, lockfiles or trusted automation. Never delete,
+    skip, weaken or remove a failing test.
     If a failure appears to expose a genuine application bug, preserve the test
     unchanged and write `suspected_bugs` with the exact failing test identifier,
     verbatim evidence and an evidence-backed reason.
@@ -942,9 +1118,11 @@ YOUR TASK
     cause is uncertain or infrastructure-related, stop for human review.
     Never edit dependencies or tests to make them pass. All fixes stay inside
     Docker and are retained only as patches for developer review.
-13. After each repair let the harness rerun failed tests and the complete
-    relevant regression suite. Report blockers such as unavailable
-    credentials, services or dependencies; never invent a passing result.
+13. After each repair let the harness rerun failed tests and the relevant
+    repository-owned suite. The private regression corpus is validated
+    separately on the trusted host and is not executed against PR code here.
+    Report blockers such as unavailable credentials, services or dependencies;
+    never invent a passing result.
 14. Write /workspace/openhands-report.json as a JSON object with
     `schema_version: 1`, `detected_stack`, `environment`, `test_commands`,
     `failures`, `dependency_installation_failures`, `root_causes`,
@@ -1431,6 +1609,7 @@ Do not stop after describing the tests. Create the files.
                 "head_sha": head_sha,
                 "sandbox_image": server_image,
                 "harness_attempts": attempt_records,
+                "regression_corpus": regression_corpus,
                 "suspected_bugs": suspected_bugs,
                 "quarantined_tests": quarantined_tests_from_attempts(attempt_records),
                 "generated_test_validation": {
