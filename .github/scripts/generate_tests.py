@@ -1267,8 +1267,11 @@ YOUR TASK
    The harness validates their structure on the trusted host; they are NOT
    executed against PR code in this workflow and are not available here.
    Never create, modify, import, copy, or include a tests/regression/ directory
-   or any regression archive in your test command. Do not weaken or delete
-   existing tests.
+   or any regression archive in your test command. If you do test an archive or
+   extraction helper, member paths such as tests/regression/test_x.py are
+   interpreted relative to the destination (the workspace root): pass that
+   root as the destination and do not add an extra tests/ component. Do not
+   weaken or delete existing tests.
 10. Use descriptive test names.
 11. Prepare the detected complete-suite command and verify dependencies.
     Do not run the complete repository test suite during preparation; the
