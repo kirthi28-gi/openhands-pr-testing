@@ -23,6 +23,8 @@ if str(SCRIPT_DIR) not in sys.path:
 from pr_test_harness import (
     DIAGNOSIS_EXAMPLE,
     GENERATED_TEST_IMPORT_RULE,
+    _python_runner,
+    classify_failure,
     REPORT_EVIDENCE_RULE,
     SCHEMA_HINT,
     diagnosis_prompt_with_schema_hint,
@@ -35,7 +37,9 @@ from pr_test_harness import (
     files_in_unified_diff,
     final_failure_category,
     load_agent_report,
+    normalize_python_test_command,
     normalize_unified_git_patch,
+    resolve_selected_interpreter,
     run_repair_loop,
     run_environment_recovery,
     sandbox_test_command,
@@ -355,6 +359,9 @@ def normal_summary_text(
         f"- Result: {'PASSED' if test_result.exit_code == 0 else 'FAILED'}\n"
         f"- Failure category: {report['final_failure_category'] or 'none'}\n"
         f"- Workflow failure category: {report['workflow_failure_category'] or 'none'}\n"
+        f"- Failure class: {(report.get('failure_classification') or {}).get('category', 'none')}\n"
+        f"- Failure evidence: "
+        f"{((report.get('failure_classification') or {}).get('evidence') or ['none'])[0]}\n"
         f"- Attempts: {len(attempt_records)}\n\n"
         f"- Agent report valid: {'yes' if report['report_valid'] else 'no'}\n"
         f"- Private regression corpus: "
@@ -365,13 +372,18 @@ def normal_summary_text(
     )
 
 
-def fallback_summary_text(error_name: str, final_category, workflow_category) -> str:
+def fallback_summary_text(
+    error_name: str, final_category, workflow_category, failure_classification=None
+) -> str:
     """Render the exception/fallback GitHub Actions summary."""
+    classification = failure_classification or {}
     return (
         "\n## OpenHands PR Test Report\n\n"
         f"- Result: Failed before verified completion ({error_name}).\n"
         f"- Failure category: {final_category or 'none'}\n"
         f"- Workflow failure category: {workflow_category or 'none'}\n"
+        f"- Failure class: {classification.get('category', 'none')}\n"
+        f"- Failure evidence: {(classification.get('evidence') or ['none'])[0]}\n"
         "- A failure report and generated-tests artifact were retained.\n"
     )
 
@@ -389,6 +401,19 @@ def fallback_report_categories(output_dir: Path) -> tuple[str, str]:
         data.get("final_failure_category") or "none",
         data.get("workflow_failure_category") or "none",
     )
+
+
+def fallback_failure_classification(output_dir: Path) -> dict:
+    """Read the structured classification from the fallback report."""
+    report_path = output_dir / "openhands-report.json"
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    classification = data.get("failure_classification")
+    return classification if isinstance(classification, dict) else {}
 
 
 def quarantined_tests_from_attempts(attempt_records: list) -> list:
@@ -1456,8 +1481,37 @@ Do not stop after describing the tests. Create the files.
                     validated_command = validate_test_command(
                         command_result.stdout, repo_path
                     )
+                    # Resolve exactly one interpreter for Python commands and
+                    # rewrite them to use it explicitly. Collection, repair and
+                    # final execution all consume validated_command. Unsupported
+                    # non-Python ecosystems are left untouched; invalid Python
+                    # commands must fail loudly instead of being swallowed.
+                    if _python_runner(shlex.split(validated_command)):
+                        try:
+                            selected_interpreter = resolve_selected_interpreter(
+                                validated_command, VERIFICATION_PYTHON
+                            )
+                            normalized_command = normalize_python_test_command(
+                                validated_command, VERIFICATION_PYTHON
+                            )
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                f"Invalid Python verification command: {exc}"
+                            ) from exc
+                        interpreter_check = workspace.execute_command(
+                            f"test -x {shlex.quote(selected_interpreter)}"
+                        )
+                        if interpreter_check.exit_code != 0:
+                            raise RuntimeError(
+                                f"Selected verification interpreter {selected_interpreter!r} "
+                                "is unavailable or not executable in the sandbox"
+                            )
+                        validated_command = normalized_command
                     environment_verification = verify_test_environment(
-                        workspace, repo_path, validated_command
+                        workspace,
+                        repo_path,
+                        validated_command,
+                        verification_python=VERIFICATION_PYTHON,
                     )
                     if generated_tests_manifest is None:
                         message = generated_tests_snapshot_error or "Generated-test integrity snapshot is unavailable; suite execution was blocked."
@@ -1482,7 +1536,10 @@ Do not stop after describing the tests. Create the files.
                         conversation,
                         environment_verification,
                         lambda: verify_test_environment(
-                            workspace, repo_path, validated_command
+                            workspace,
+                            repo_path,
+                            validated_command,
+                            verification_python=VERIFICATION_PYTHON,
                         ),
                         max_attempts=int(os.getenv("MAX_ENVIRONMENT_REPAIR_ATTEMPTS", "2")),
                         integrity_guard=generated_tests_guard,
@@ -1664,6 +1721,15 @@ Do not stop after describing the tests. Create the files.
             ) = report_failure_categories(
                 report, attempt_records, environment_ready
             )
+            failure_classification_value = classify_failure(
+                environment_verification=environment_verification,
+                attempt_records=attempt_records,
+                generated_test_validation=generated_test_validation,
+                report=report,
+                stdout=test_result.stdout or "",
+                stderr=test_result.stderr or "",
+                workflow_error=agent_error,
+            )
             report.update({
                 "pr_number": pr_number,
                 "base_sha": base_sha,
@@ -1708,6 +1774,7 @@ Do not stop after describing the tests. Create the files.
                 "validated_test_command": validated_command,
                 "final_failure_category": final_failure_category_value,
                 "workflow_failure_category": workflow_failure_category_value,
+                "failure_classification": failure_classification_value,
                 "runner_error": agent_error,
                 "conversation_error": conversation_error,
                 "verified_test_results": [
@@ -1761,6 +1828,7 @@ Do not stop after describing the tests. Create the files.
                 "validated_test_command": validated_command,
                 "environment_ready": environment_ready,
                 "quarantined_tests": quarantined_tests_from_attempts(attempt_records),
+                "failure_classification": failure_classification_value,
                 "attempts": attempt_records,
                 "final_stdout": test_result.stdout or "",
                 "final_stderr": test_result.stderr or "",
@@ -1890,7 +1958,10 @@ def main():
         write_summary_text(
             os.getenv("GITHUB_STEP_SUMMARY"),
             fallback_summary_text(
-                type(exc).__name__, final_category, workflow_category
+                type(exc).__name__,
+                final_category,
+                workflow_category,
+                fallback_failure_classification(output_dir),
             ),
         )
         raise

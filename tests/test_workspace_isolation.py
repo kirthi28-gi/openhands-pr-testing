@@ -352,13 +352,23 @@ def test_full_generator_pipeline_never_sends_private_corpus_to_sandbox(
             "limitations": [],
         },
     )
-    monkeypatch.setattr(gt, "sandbox_test_command", lambda *a, **k: "pytest -q")
+    execution_commands = []
+
+    monkeypatch.setattr(
+        gt,
+        "sandbox_test_command",
+        lambda command, **k: execution_commands.append(command) or command,
+    )
     monkeypatch.setattr(
         gt,
         "run_repair_loop",
-        lambda *a, **k: events.append("repair") or (
-            SimpleNamespace(exit_code=0, stdout="1 passed", stderr=""),
-            attempt_records,
+        lambda workspace_obj, conversation_obj, command, *a, **k: (
+            events.append("repair")
+            or execution_commands.append(command)
+            or (
+                SimpleNamespace(exit_code=0, stdout="1 passed", stderr=""),
+                attempt_records,
+            )
         ),
     )
 
@@ -407,3 +417,18 @@ def test_full_generator_pipeline_never_sends_private_corpus_to_sandbox(
         "verify",
         "repair",
     ]
+    normalized_command = "/workspace/.venv/bin/python -m pytest -q"
+    assert execution_commands == [normalized_command, normalized_command]
+
+    generated_report = json.loads(
+        (automation / "generated-tests/openhands-report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    test_results = json.loads(
+        (automation / "generated-tests/openhands-test-results.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert generated_report["failure_classification"]["category"] == "none"
+    assert test_results["failure_classification"]["category"] == "none"

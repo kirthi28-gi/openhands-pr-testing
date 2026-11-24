@@ -128,6 +128,9 @@ SANDBOX_ENV_ALLOWLIST = {
     "PYTHONPATH", "VIRTUAL_ENV", "CI", "DEBIAN_FRONTEND",
     "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE",
 }
+# Forced (not overridable) settings for every sandboxed command. Pipenv would
+# otherwise load a PR-controlled .env file and could inject PYTHONPATH.
+FORCED_SANDBOX_ENV = {"PIPENV_DONT_LOAD_ENV": "1"}
 
 _SHELL_OPERATOR_CHARS = ";&|<>\n\r\x00"
 _SHELL_EXPANSION_CHARS = "*?[]{}~"
@@ -398,18 +401,14 @@ def _python_runner(tokens: list[str]) -> bool:
     if re.fullmatch(r"python3\.\d+", tokens[0]):
         return _python_module_runner(tokens[1:])
     if tokens[0] == "uv":
-        if len(tokens) < 4 or tokens[1] != "run":
+        if len(tokens) < 3 or tokens[1] != "run":
             return False
         options = tokens[2:]
-        if options[:2] == ["--offline", "--no-sync"]:
-            runner = options[2:]
-        elif options[:2] == ["--no-sync", "--offline"]:
-            runner = options[2:]
-        else:
-            return False
-        if runner and runner[0] == "--":
-            runner = runner[1:]
-        return _python_runner(runner)
+        if options[:2] in (["--offline", "--no-sync"], ["--no-sync", "--offline"]):
+            options = options[2:]
+        if options and options[0] == "--":
+            options = options[1:]
+        return _python_runner(options)
     if tokens[0] == "poetry":
         return len(tokens) >= 3 and tokens[1] == "run" and _python_runner(tokens[2:])
     if tokens[0] == "pipenv":
@@ -739,31 +738,107 @@ def _run_verification_check(workspace, checks: list[dict], name: str, argv: list
     return passed
 
 
-def _python_verification_parts(tokens: list[str]) -> tuple[list[str], str, list[str], str]:
-    """Return wrapper, interpreter, runner argv, and test framework."""
-    wrapper: list[str] = []
-    if tokens[0] == "uv":
-        wrapper = tokens[:4]
-        runner = tokens[4:]
-        if runner and runner[0] == "--":
-            runner = runner[1:]
-    elif tokens[0] in {"poetry", "pipenv"}:
-        wrapper = tokens[:2]
-        runner = tokens[2:]
-    else:
-        runner = tokens
+UNQUALIFIED_PYTHON = {"python", "python3"}
 
+
+def _python_runner_start(tokens: list[str]) -> int:
+    """Return the index of the Python runner token, skipping wrappers."""
+    if tokens[0] == "uv":
+        index = 2
+        if tokens[2:4] in (["--offline", "--no-sync"], ["--no-sync", "--offline"]):
+            index = 4
+        if index < len(tokens) and tokens[index] == "--":
+            index += 1
+        return index
+    if tokens[0] in {"poetry", "pipenv"}:
+        return 2
+    return 0
+
+
+def _validated_interpreter(interpreter: str) -> str:
+    if interpreter in UNQUALIFIED_PYTHON or re.fullmatch(r"python3\.\d+", interpreter):
+        raise ValueError(
+            f"Unqualified interpreter {interpreter!r} is not permitted for verification; "
+            "configure an explicit virtual-environment Python path"
+        )
+    return interpreter
+
+
+def configured_verification_python() -> str | None:
+    value = os.getenv("OH_VERIFICATION_PYTHON")
+    return value or None
+
+
+def _python_verification_parts(
+    tokens: list[str], configured_interpreter: str | None = None
+) -> tuple[list[str], str, list[str], str]:
+    """Return wrapper, explicit interpreter, runner argv, and framework."""
+    if not tokens:
+        raise ValueError("Empty command cannot provide a Python interpreter")
+    start = _python_runner_start(tokens)
+    wrapper = tokens[:start]
+    runner = tokens[start:]
+    if not runner:
+        raise ValueError("Command wrapper has no Python runner")
+
+    configured = configured_interpreter or configured_verification_python()
     if runner[0] in {"pytest", ".venv/bin/pytest", "/workspace/.venv/bin/pytest"}:
-        interpreter = {
-            ".venv/bin/pytest": ".venv/bin/python",
-            "/workspace/.venv/bin/pytest": "/workspace/.venv/bin/python",
-        }.get(runner[0], "python")
-        return wrapper, interpreter, [runner[0]], "pytest"
-    if runner[0] in {"python", "python3", ".venv/bin/python", "/workspace/.venv/bin/python"} or re.fullmatch(r"python3\.\d+", runner[0]):
-        interpreter = runner[0]
-        framework = runner[2]
-        return wrapper, interpreter, [interpreter, "-m", framework], framework
-    raise ValueError("Could not derive the Python runtime and test runner from the validated command")
+        if not configured:
+            raise ValueError(
+                "Bare pytest command does not identify a Python interpreter; "
+                "set OH_VERIFICATION_PYTHON or use <interpreter> -m pytest"
+            )
+        interpreter = _validated_interpreter(configured)
+        return wrapper, interpreter, [interpreter, "-m", "pytest"], "pytest"
+
+    if runner[0] in UNQUALIFIED_PYTHON or re.fullmatch(r"python3\.\d+", runner[0]):
+        if not configured:
+            raise ValueError(
+                f"Unqualified interpreter {runner[0]!r} cannot be used for verification; "
+                "set OH_VERIFICATION_PYTHON or use an explicit interpreter path"
+            )
+        interpreter = _validated_interpreter(configured)
+    elif runner[0] in {".venv/bin/python", "/workspace/.venv/bin/python"}:
+        interpreter = _validated_interpreter(runner[0])
+    else:
+        raise ValueError(
+            "Could not derive the Python runtime and test runner from the validated command"
+        )
+
+    if len(runner) < 3 or runner[1] != "-m":
+        raise ValueError("Python test command must use <interpreter> -m <framework>")
+    framework = runner[2]
+    return wrapper, interpreter, [interpreter, "-m", framework], framework
+
+
+def resolve_selected_interpreter(
+    command: str, configured_interpreter: str | None = None
+) -> str:
+    """Resolve the single interpreter that must be used for verification."""
+    return _python_verification_parts(
+        shlex.split(command), configured_interpreter
+    )[1]
+
+
+def normalize_python_test_command(
+    command: str, configured_interpreter: str | None = None
+) -> str:
+    """Rewrite a validated Python test command to use the explicit interpreter."""
+    tokens = shlex.split(command)
+    wrapper, interpreter, _, framework = _python_verification_parts(
+        tokens, configured_interpreter
+    )
+    if wrapper and wrapper[0] == "uv":
+        required_flags = ("--offline", "--no-sync")
+        if not all(flag in wrapper for flag in required_flags):
+            wrapper = ["uv", "run", *required_flags]
+    start = _python_runner_start(tokens)
+    runner = tokens[start:]
+    if runner[0] in {"pytest", ".venv/bin/pytest", "/workspace/.venv/bin/pytest"}:
+        normalized_runner = [interpreter, "-m", framework, *runner[1:]]
+    else:
+        normalized_runner = [interpreter, *runner[1:]]
+    return shlex.join([*wrapper, *normalized_runner])
 
 
 def _javascript_script_tokens(repository_root: Path) -> tuple[dict, list[str]]:
@@ -809,7 +884,12 @@ def _javascript_collection_runner(tokens: list[str]) -> list[str] | None:
     return None
 
 
-def verify_test_environment(workspace, repository_root: Path, test_command: str) -> dict:
+def verify_test_environment(
+    workspace,
+    repository_root: Path,
+    test_command: str,
+    verification_python: str | None = None,
+) -> dict:
     """Independently check runtime, runner, dependency health and test discovery.
 
     Collection/listing is recorded separately and is never sufficient by itself
@@ -854,7 +934,9 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
 
     if _python_runner(tokens):
         ecosystem = "python"
-        wrapper, interpreter, runner, framework = _python_verification_parts(tokens)
+        wrapper, interpreter, runner, framework = _python_verification_parts(
+            tokens, verification_python
+        )
         runtime_ok = check("python_runtime", [*wrapper, interpreter, "--version"])
         runner_version_args = ["-h"] if framework == "unittest" else ["--version"]
         runner_ok = check("python_test_runner", [*wrapper, *runner, *runner_version_args])
@@ -867,7 +949,14 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
         if pip_available:
             pip_check = check("python_dependency_consistency", [*wrapper, interpreter, "-m", "pip", "check"])
         else:
-            limitations.append("pip is unavailable in the selected Python environment; dependency consistency relies on imports during collection.")
+            failures.append(
+                f"python_pip_availability: pip is unavailable in selected interpreter "
+                f"{interpreter!r}; use a virtual environment with pip installed"
+            )
+            limitations.append(
+                f"pip is unavailable in selected interpreter {interpreter!r}; "
+                "dependency consistency cannot be verified"
+            )
         imports_ok = check(
             "python_trusted_dependency_imports",
             [*wrapper, interpreter, "-c", VERIFICATION_IMPORT_PROBE],
@@ -882,8 +971,8 @@ def verify_test_environment(workspace, repository_root: Path, test_command: str)
             )
             collection_ok = check_collection("python_test_collection", [*wrapper, interpreter, "-c", discovery])
         required_ok = (
-            runtime_ok and runner_ok and pip_probe
-            and (pip_check or not pip_available) and imports_ok and collection_ok
+            runtime_ok and runner_ok and pip_probe and pip_available
+            and pip_check and imports_ok and collection_ok
         )
     elif tokens[0] in {"npm", "pnpm", "yarn"}:
         ecosystem = "javascript"
@@ -1079,6 +1168,8 @@ def sandbox_test_command(command: str) -> str:
         environment_args.append(
             f'{name}="${{{name}:-{default}}}"'
         )
+    for name, value in FORCED_SANDBOX_ENV.items():
+        environment_args.append(f"{name}={shlex.quote(value)}")
 
     return "cd /workspace && " + " ".join(environment_args) + " -- " + shlex.join(argv)
 
@@ -1743,6 +1834,41 @@ def normalize_unified_git_patch(
     return "\n".join(result) + ("\n" if result else "")
 
 
+def _fallback_result_streams(output_dir: Path) -> tuple[str, str]:
+    """Read any captured stdout/stderr from the test-results artifact."""
+    results_path = output_dir / "openhands-test-results.json"
+    try:
+        data = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    stdout = data.get("final_stdout")
+    stderr = data.get("final_stderr")
+    return (
+        stdout if isinstance(stdout, str) else "",
+        stderr if isinstance(stderr, str) else "",
+    )
+
+
+def _quarantined_tests_from_attempts(attempt_records) -> list[dict]:
+    """Collect quarantined generated tests in the normal artifact's shape."""
+    records = []
+    if not isinstance(attempt_records, list):
+        return records
+    for item in attempt_records:
+        if not isinstance(item, dict) or not item.get("quarantined_test"):
+            continue
+        records.append({
+            "attempt": item.get("attempt"),
+            "test": item.get("quarantined_test"),
+            "reason": item.get("quarantine_reason"),
+            "evidence": item.get("quarantine_evidence", []),
+            "status": item.get("quarantine_status"),
+        })
+    return records
+
+
 def ensure_failure_artifacts(
     output_dir: Path,
     error_name: str,
@@ -1788,13 +1914,51 @@ def ensure_failure_artifacts(
     if not isinstance(report.get("detected_stack"), dict):
         report["detected_stack"] = {}
     environment_ready = environment_ready_from_report(report)
+    environment = report.get("environment")
+    environment_status = (
+        environment.get("status")
+        if isinstance(environment, dict) and isinstance(environment.get("status"), str)
+        else None
+    )
+    captured_stdout, captured_stderr = _fallback_result_streams(output_dir)
+    if not isinstance(report.get("final_stdout"), str):
+        report_stdout = captured_stdout
+    else:
+        report_stdout = report["final_stdout"]
+    # Artifact streams mirror the normal execution artifact and preserve any
+    # streams captured by an earlier artifact. The workflow traceback stays in
+    # the classification input only, so repeated fallback runs do not grow the
+    # retained stderr or duplicate evidence.
+    artifact_stderr = (
+        report["final_stderr"]
+        if isinstance(report.get("final_stderr"), str)
+        else captured_stderr
+    )
+    stderr_parts = [
+        part for part in (error_traceback, captured_stderr)
+        if isinstance(part, str) and part.strip()
+    ]
     attempt_records = (
         report.get("harness_attempts")
         if isinstance(report.get("harness_attempts"), list) else []
     )
+    quarantined_tests = report.get("quarantined_tests")
+    if not isinstance(quarantined_tests, list) or not quarantined_tests:
+        quarantined_tests = _quarantined_tests_from_attempts(attempt_records)
     final_category = final_failure_category(report, attempt_records, environment_ready)
     workflow_category = workflow_failure_category(
         report, environment_ready, attempt_records
+    )
+    report["failure_classification"] = classify_failure(
+        environment_verification=report.get("environment_verification", {}),
+        attempt_records=attempt_records,
+        generated_test_validation=report.get("generated_test_validation", {}),
+        report=report,
+        stdout=report_stdout,
+        stderr="\n".join(stderr_parts),
+        workflow_error=error_name,
+        environment_ready=environment_ready,
+        environment_status=environment_status,
     )
     if not report_was_validated:
         limitations = report.get("limitations", [])
@@ -1860,8 +2024,12 @@ def ensure_failure_artifacts(
         "final_exit_code": report.get("harness_final_exit_code"),
         "validated_test_command": report.get("validated_test_command"),
         "environment_ready": report.get("environment_ready", False),
-        "attempts": report.get("harness_attempts", []),
+        "quarantined_tests": quarantined_tests,
+        "failure_classification": report["failure_classification"],
+        "attempts": attempt_records,
         "verified_test_results": report.get("verified_test_results", []),
+        "final_stdout": report_stdout,
+        "final_stderr": artifact_stderr,
     }, indent=2), encoding="utf-8")
 
     archive_path = output_dir / "generated-tests.tar.gz"
@@ -1886,13 +2054,29 @@ _INFRASTRUCTURE_FAILURE_RE = re.compile(
     r"Could not resolve dependencies|Could not resolve package|No matching distribution|"
     r"Could not find a version that satisfies|command not found|"
     r"Connection refused|ECONNREFUSED|ETIMEDOUT|ServiceUnavailable|"
-    r"Could not connect|Failed to download|Failed to resolve plugin",
+    r"Could not connect|Failed to download|Failed to resolve plugin|"
+    r"Docker is not available|permission denied|Could not connect to the Docker daemon",
     re.I,
 )
 _TEST_FAILURE_EVIDENCE_RE = re.compile(
     r"(?im)^\s*(?:FAILED\b|FAIL:\s|FAIL\s)|"
     r"AssertionError|AssertionFailedError|AssertionError|"
     r"Expected:|Received:|expected .{0,100}(?:got|received|actual)",
+)
+_DEPENDENCY_FAILURE_RE = re.compile(
+    r"ModuleNotFoundError|No module named|ImportError|Cannot find module|"
+    r"ERR_MODULE_NOT_FOUND|Could not resolve dependencies|Could not resolve package|"
+    r"No matching distribution|Could not find a version that satisfies|command not found",
+    re.I,
+)
+_SYNTAX_FAILURE_RE = re.compile(r"SyntaxError|IndentationError|Unexpected token", re.I)
+_PR_FILE_LINE_RE = re.compile(r'(?m)^\s*File\s+"(?P<path>[^"]+)",\s+line\s+\d+.*$')
+_SETUP_FAILURE_RE = re.compile(
+    r"ERROR at setup of|fixture .{0,120}not found|Fixture .{0,120}not found|"
+    r"AttributeError: ['\"]Mock['\"] object has no attribute|"
+    r"Mock object has no attribute|unexpected keyword argument|"
+    r"badly configured fixture|TypeError: .{0,100}(?:mock|fixture)",
+    re.I,
 )
 _PYTEST_NODE_RE = re.compile(r"(?im)^\s*(?:FAILED|ERROR)\s+([^\s]+::[^\s]+)")
 _JEST_TEST_RE = re.compile(r"(?m)^\s*●\s*(.+?)\s*$")
@@ -1910,6 +2094,367 @@ def _failing_test_identifiers(output: str) -> set[str]:
     identifiers.update(_MOCHA_TEST_RE.findall(output))
     identifiers.update(f"{suite} > {test}" for suite, test in _GRADLE_TEST_RE.findall(output))
     return {item.strip() for item in identifiers if item.strip()}
+
+
+FAILURE_CLASSIFICATION_CATEGORIES = (
+    "none",
+    "pr_syntax_error",
+    "pr_logic_error",
+    "incorrect_generated_test",
+    "invalid_test_setup",
+    "missing_dependency",
+    "sandbox_or_infrastructure",
+    "inconclusive",
+)
+
+
+def _classification_outputs(
+    environment_verification,
+    attempt_records,
+    generated_test_validation,
+    report,
+    stdout,
+    stderr,
+) -> list[str]:
+    outputs = []
+    for value in (stdout, stderr):
+        if isinstance(value, str) and value.strip():
+            outputs.append(value)
+    if isinstance(environment_verification, dict):
+        for failure in environment_verification.get("failures", []):
+            if isinstance(failure, str) and failure.strip():
+                outputs.append(failure)
+        for check in environment_verification.get("checks", []):
+            if isinstance(check, dict):
+                value = check.get("output")
+                if isinstance(value, str) and value.strip():
+                    outputs.append(value)
+    if isinstance(attempt_records, list):
+        for attempt in attempt_records:
+            if not isinstance(attempt, dict):
+                continue
+            for key in ("output", "execution_error", "repair_decision_reason"):
+                value = attempt.get(key)
+                if isinstance(value, str) and value.strip():
+                    outputs.append(value)
+            diagnosis = attempt.get("diagnosis")
+            if isinstance(diagnosis, dict):
+                for key in ("evidence", "root_cause_evidence"):
+                    quotes = diagnosis.get(key)
+                    if isinstance(quotes, list):
+                        outputs.extend(
+                            quote for quote in quotes
+                            if isinstance(quote, str) and quote.strip()
+                        )
+    if isinstance(generated_test_validation, dict):
+        for result in generated_test_validation.get("results", []):
+            if isinstance(result, dict):
+                value = result.get("output")
+                if isinstance(value, str) and value.strip():
+                    outputs.append(value)
+        for error in generated_test_validation.get("errors", []):
+            if isinstance(error, str) and error.strip():
+                outputs.append(error)
+    if isinstance(report, dict):
+        for failure in report.get("failures", []):
+            if not isinstance(failure, dict):
+                continue
+            quotes = failure.get("evidence")
+            if isinstance(quotes, list):
+                outputs.extend(
+                    quote for quote in quotes
+                    if isinstance(quote, str) and quote.strip()
+                )
+    return outputs
+
+
+def _evidence_lines(outputs: list[str], pattern: re.Pattern, limit: int = 4) -> list[str]:
+    evidence = []
+    for output in outputs:
+        for line in output.splitlines():
+            candidate = line.rstrip("\r\n")
+            if candidate.strip() and pattern.search(candidate) and candidate not in evidence:
+                evidence.append(candidate)
+                if len(evidence) >= limit:
+                    return evidence
+    return evidence
+
+
+def _pr_owned_file_evidence(outputs: list[str], limit: int = 2) -> list[str]:
+    evidence = []
+    excluded = (
+        "tests/generated", ".github", "site-packages", "dist-packages",
+        "node_modules", ".venv", "venv",
+    )
+    source_suffixes = {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rb",
+        ".php", ".cs", ".swift", ".kt", ".rs", ".feature",
+    }
+    for output in outputs:
+        for line in output.splitlines():
+            match = _PR_FILE_LINE_RE.match(line)
+            if not match:
+                continue
+            raw_path = match.group("path").replace("\\", "/")
+            if raw_path.startswith("/workspace/"):
+                relative = raw_path[len("/workspace/"):]
+            elif raw_path.startswith("/") or re.match(r"^[A-Za-z]:", raw_path):
+                continue
+            else:
+                relative = raw_path
+            relative = relative[2:] if relative.startswith("./") else relative
+            parts = relative.split("/")
+            if not relative or ".." in parts:
+                continue
+            if any(marker in relative for marker in excluded):
+                continue
+            if Path(relative).suffix.lower() not in source_suffixes:
+                continue
+            candidate = line.rstrip("\r\n")
+            if candidate not in evidence:
+                evidence.append(candidate)
+                if len(evidence) >= limit:
+                    return evidence
+    return evidence
+
+
+def _generated_validation_outputs(generated_test_validation) -> list[str]:
+    """Return only outputs produced by generated-test validation."""
+    outputs = []
+    if not isinstance(generated_test_validation, dict):
+        return outputs
+    for result in generated_test_validation.get("results", []):
+        if isinstance(result, dict):
+            value = result.get("output")
+            if isinstance(value, str) and value.strip():
+                outputs.append(value)
+    for error in generated_test_validation.get("errors", []):
+        if isinstance(error, str) and error.strip():
+            outputs.append(error)
+    return outputs
+
+
+def _dependency_evidence_lines(outputs: list[str]) -> list[str]:
+    """Return real dependency/import evidence, excluding assertion messages."""
+    return [
+        line for line in _evidence_lines(outputs, _DEPENDENCY_FAILURE_RE)
+        if not _TEST_FAILURE_EVIDENCE_RE.search(line)
+    ]
+
+
+def _classification_result(
+    category: str,
+    source: str,
+    detail: str,
+    evidence: list[str],
+    conflicts: list[str] | None = None,
+) -> dict:
+    evidence = list(evidence)
+    return {
+        "version": 1,
+        "category": category,
+        "source": source,
+        "detail": detail,
+        "evidence": evidence,
+        "evidence_status": "captured" if evidence else "unavailable",
+        "conflicts": list(conflicts or []),
+    }
+
+
+def classify_failure(
+    environment_verification=None,
+    attempt_records=None,
+    generated_test_validation=None,
+    report=None,
+    stdout="",
+    stderr="",
+    workflow_error=None,
+    environment_ready=None,
+    environment_status=None,
+) -> dict:
+    """Classify a verification failure from already-validated evidence only.
+
+    This function never changes application code, generated tests, repair
+    decisions, or any existing validator. It only produces a structured,
+    evidence-backed classification for reports and summaries.
+    """
+    outputs = _classification_outputs(
+        environment_verification,
+        attempt_records,
+        generated_test_validation,
+        report,
+        stdout,
+        stderr,
+    )
+    attempts = attempt_records if isinstance(attempt_records, list) else []
+    env = environment_verification if isinstance(environment_verification, dict) else {}
+    if environment_ready is not None:
+        env_ready = bool(environment_ready)
+    elif isinstance(report, dict) and "environment_ready" in report:
+        env_ready = bool(report.get("environment_ready"))
+    elif environment_status == "blocked":
+        env_ready = False
+    else:
+        env_ready = bool(env.get("ready", True))
+    validation = generated_test_validation if isinstance(generated_test_validation, dict) else {}
+    agent_report = report if isinstance(report, dict) else {}
+
+    dependency_evidence = _dependency_evidence_lines(outputs)
+    infra_evidence = _evidence_lines(outputs, _INFRASTRUCTURE_FAILURE_RE)
+    syntax_evidence = _evidence_lines(outputs, _SYNTAX_FAILURE_RE)
+    pr_file_evidence = _pr_owned_file_evidence(outputs)
+    generated_outputs = _generated_validation_outputs(validation)
+    generated_setup_evidence = _evidence_lines(generated_outputs, _SETUP_FAILURE_RE)
+    generated_assertion_evidence = _evidence_lines(
+        generated_outputs, _TEST_FAILURE_EVIDENCE_RE
+    )
+
+    validated_diagnoses = [
+        attempt.get("diagnosis") for attempt in attempts
+        if isinstance(attempt, dict)
+        and isinstance(attempt.get("diagnosis"), dict)
+        and attempt["diagnosis"].get("validated")
+    ]
+    app_diagnosis = next(
+        (
+            diagnosis for diagnosis in validated_diagnoses
+            if diagnosis.get("category") in {"application bug", "regression"}
+        ),
+        None,
+    )
+    generated_invalid = (
+        validation.get("classification") == "invalid_generated_test"
+        or any(
+            isinstance(result, dict)
+            and result.get("classification") == "invalid_generated_test"
+            for result in validation.get("results", [])
+        )
+    )
+    rejected = _diagnosis_was_rejected(agent_report, attempts)
+    final_attempt = next(
+        (attempt for attempt in reversed(attempts) if isinstance(attempt, dict)),
+        {},
+    )
+    final_exit = final_attempt.get("exit_code")
+
+    conflicts = []
+    if app_diagnosis and (dependency_evidence or infra_evidence):
+        conflicts.append("validated application diagnosis conflicts with dependency/infrastructure evidence")
+    if app_diagnosis and generated_invalid:
+        conflicts.append("validated application diagnosis conflicts with generated-test validation failure")
+    if syntax_evidence and generated_invalid:
+        conflicts.append("syntax evidence conflicts with generated-test validation failure")
+    if (
+        generated_setup_evidence and generated_assertion_evidence
+        and generated_invalid
+    ):
+        conflicts.append("generated-test setup error conflicts with assertion failure evidence")
+    if conflicts:
+        return _classification_result(
+            "inconclusive", "conflicting_evidence",
+            "Conflicting captured evidence prevents a specific classification.",
+            (
+                generated_setup_evidence + generated_assertion_evidence
+                + dependency_evidence + syntax_evidence
+            )[:4],
+            conflicts,
+        )
+
+    if env_ready and final_exit == 0 and not workflow_error and not generated_invalid:
+        passed_evidence = _evidence_lines(outputs, re.compile(r"\bpassed\b", re.I), limit=1)
+        return _classification_result(
+            "none", "verified_success", "No verified failure was captured.", passed_evidence
+        )
+
+    if not env_ready:
+        if dependency_evidence:
+            return _classification_result(
+                "missing_dependency", "environment_verification",
+                "Dependency evidence was captured before suite execution.",
+                dependency_evidence,
+            )
+        infra_from_env = env.get("failures") or infra_evidence
+        if infra_evidence or infra_from_env or workflow_error:
+            evidence = infra_evidence or [
+                item for item in infra_from_env if isinstance(item, str)
+            ]
+            if workflow_error and not evidence:
+                evidence = [str(workflow_error)]
+            return _classification_result(
+                "sandbox_or_infrastructure", "environment_verification",
+                "Sandbox or infrastructure verification failed before a verified suite run.",
+                evidence[:4],
+            )
+        return _classification_result(
+            "inconclusive", "environment_verification",
+            "Environment was not ready but no exact failure evidence was captured.",
+            [],
+        )
+
+    if dependency_evidence:
+        return _classification_result(
+            "missing_dependency", "captured_output",
+            "Dependency evidence was captured without a validated application diagnosis.",
+            dependency_evidence,
+        )
+
+    if pr_file_evidence and syntax_evidence:
+        return _classification_result(
+            "pr_syntax_error", "captured_output",
+            "Syntax error references a PR-owned file.",
+            pr_file_evidence[:1] + syntax_evidence[:1],
+        )
+
+    if generated_invalid:
+        if generated_setup_evidence:
+            return _classification_result(
+                "invalid_test_setup", "generated_test_validation",
+                "Generated-test validation captured setup/mock/fixture failure evidence.",
+                generated_setup_evidence,
+            )
+        generated_failure_ids = _failing_test_identifiers(
+            "\n".join(generated_outputs)
+        )
+        if generated_assertion_evidence or generated_failure_ids:
+            evidence = generated_assertion_evidence or _evidence_lines(
+                generated_outputs, re.compile(r"FAILED|ERROR", re.I), limit=4
+            )
+            return _classification_result(
+                "incorrect_generated_test", "generated_test_validation",
+                "Generated-test validation captured assertion/failure evidence.",
+                evidence,
+            )
+        return _classification_result(
+            "inconclusive", "generated_test_validation",
+            "Generated tests failed but no exact assertion/setup evidence was captured.",
+            [],
+        )
+
+    if app_diagnosis:
+        evidence = [
+            quote for quote in (
+                app_diagnosis.get("evidence") or []
+            ) if isinstance(quote, str) and quote.strip()
+        ]
+        if evidence:
+            return _classification_result(
+                "pr_logic_error", "validated_diagnosis",
+                "Validated application-bug/regression diagnosis with exact output evidence.",
+                evidence[:4],
+            )
+
+    if rejected:
+        return _classification_result(
+            "inconclusive", "diagnosis_rejected",
+            "Agent diagnosis was rejected by strict evidence validation.",
+            [],
+        )
+
+    return _classification_result(
+        "inconclusive", "insufficient_evidence",
+        "Failure did not produce evidence sufficient for a specific classification.",
+        [],
+    )
 
 
 def validate_repair_diagnosis(report_text: str, attempt: int, output: str) -> dict:

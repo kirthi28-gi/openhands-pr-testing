@@ -2,6 +2,7 @@
 
 import io
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -509,7 +510,7 @@ def test_preflight_reports_missing_transitive_import_clearly():
 def _verification_workspace(imports_ok: bool):
     class Workspace:
         def execute_command(self, command, timeout=600):
-            if "find_spec('pip')" in command:
+            if "find_spec(" in command or "importlib.util" in command:
                 return SimpleNamespace(exit_code=0, stdout="available", stderr="")
             if "importlib,json" in command:
                 stdout = (
@@ -570,6 +571,268 @@ def test_verify_environment_requires_trusted_imports(tmp_path):
     assert len(import_failures) == 1
     assert "ModuleNotFoundError" in import_failures[0]["output"]
     assert "pydantic" in import_failures[0]["output"]
+
+
+def _python_repo(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_x.py").write_text("def test_ok(): pass\n")
+    (tmp_path / "requirements-dev.txt").write_text("pytest\n")
+    return tmp_path
+
+
+def _recording_interpreter_workspace(interpreter, missing=None):
+    commands = []
+
+    class Workspace:
+        def execute_command(self, command, timeout=600):
+            commands.append(command)
+            if "find_spec(" in command or "importlib.util" in command:
+                stdout = "unavailable" if missing == "pip" else "available"
+                return SimpleNamespace(exit_code=0, stdout=stdout, stderr="")
+            if missing == "pytest" and "-m pytest" in command and "--version" in command:
+                return SimpleNamespace(
+                    exit_code=1, stdout="No module named pytest", stderr=""
+                )
+            if "--collect-only" in command:
+                return SimpleNamespace(
+                    exit_code=0, stdout="tests/test_x.py::test_ok", stderr=""
+                )
+            if "--version" in command:
+                stdout = "pytest 9.2.0" if "-m pytest" in command else "Python 3.12.16"
+                return SimpleNamespace(exit_code=0, stdout=stdout, stderr="")
+            if "importlib,json" in command:
+                return SimpleNamespace(exit_code=0, stdout="imports ok", stderr="")
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    return Workspace(), commands
+
+
+def test_absolute_venv_interpreter_is_used_for_every_python_check(tmp_path):
+    interpreter = "/workspace/.venv/bin/python"
+    workspace, commands = _recording_interpreter_workspace(interpreter)
+
+    result = harness.verify_test_environment(
+        workspace,
+        _python_repo(tmp_path),
+        "pytest -q",
+        verification_python=interpreter,
+    )
+
+    assert result["ready"] is True
+    assert commands
+    for command in commands:
+        assert interpreter in command
+        assert not command.startswith("python")
+
+
+def test_relative_venv_interpreter_is_used_for_every_python_check(tmp_path):
+    interpreter = ".venv/bin/python"
+    workspace, commands = _recording_interpreter_workspace(interpreter)
+
+    result = harness.verify_test_environment(
+        workspace,
+        _python_repo(tmp_path),
+        f"{interpreter} -m pytest -q",
+        verification_python=interpreter,
+    )
+
+    assert result["ready"] is True
+    for command in commands:
+        assert interpreter in command
+        assert not command.startswith("python")
+
+
+def test_no_system_python_fallback_without_configured_interpreter(tmp_path, monkeypatch):
+    monkeypatch.delenv("OH_VERIFICATION_PYTHON", raising=False)
+    workspace, commands = _recording_interpreter_workspace("python")
+
+    with pytest.raises(ValueError, match="does not identify a Python interpreter"):
+        harness.verify_test_environment(
+            workspace, _python_repo(tmp_path), "pytest -q"
+        )
+    assert commands == []
+
+
+def test_missing_pytest_in_selected_interpreter_fails_clearly(tmp_path):
+    interpreter = "/workspace/.venv/bin/python"
+    workspace, _ = _recording_interpreter_workspace(interpreter, missing="pytest")
+
+    result = harness.verify_test_environment(
+        workspace,
+        _python_repo(tmp_path),
+        "pytest -q",
+        verification_python=interpreter,
+    )
+
+    assert result["ready"] is False
+    assert any("No module named pytest" in failure for failure in result["failures"])
+    assert any(interpreter in failure for failure in result["failures"])
+
+
+def test_missing_pip_in_selected_interpreter_fails_clearly(tmp_path):
+    interpreter = "/workspace/.venv/bin/python"
+    workspace, _ = _recording_interpreter_workspace(interpreter, missing="pip")
+
+    result = harness.verify_test_environment(
+        workspace,
+        _python_repo(tmp_path),
+        "pytest -q",
+        verification_python=interpreter,
+    )
+
+    assert result["ready"] is False
+    assert any("pip is unavailable" in failure for failure in result["failures"])
+    assert any(interpreter in failure for failure in result["failures"])
+
+
+@pytest.mark.parametrize(
+    ("command", "wrapper", "normalized"),
+    [
+        (
+            "uv run python -m pytest -q",
+            "uv run --offline --no-sync",
+            "uv run --offline --no-sync /workspace/.venv/bin/python -m pytest -q",
+        ),
+        (
+            "uv run --offline --no-sync python -m pytest -q",
+            "uv run --offline --no-sync",
+            "uv run --offline --no-sync /workspace/.venv/bin/python -m pytest -q",
+        ),
+        (
+            "poetry run python -m pytest -q",
+            "poetry run",
+            "poetry run /workspace/.venv/bin/python -m pytest -q",
+        ),
+        (
+            "pipenv run python -m pytest -q",
+            "pipenv run",
+            "pipenv run /workspace/.venv/bin/python -m pytest -q",
+        ),
+    ],
+)
+def test_wrapper_normalization_preserves_semantics_and_uses_interpreter(
+    command, wrapper, normalized
+):
+    interpreter = "/workspace/.venv/bin/python"
+
+    assert harness._python_runner(shlex.split(command)) is True
+    assert (
+        harness.normalize_python_test_command(command, interpreter) == normalized
+    )
+    sandboxed = harness.sandbox_test_command(normalized)
+    assert wrapper in sandboxed
+    assert interpreter in sandboxed
+
+
+@pytest.mark.parametrize(
+    ("command", "wrapper"),
+    [
+        ("uv run python -m pytest -q", "uv run"),
+        ("poetry run python -m pytest -q", "poetry run"),
+        ("pipenv run python -m pytest -q", "pipenv run"),
+    ],
+)
+def test_wrapper_verification_uses_configured_interpreter(tmp_path, command, wrapper):
+    interpreter = "/workspace/.venv/bin/python"
+    workspace, commands = _recording_interpreter_workspace(interpreter)
+
+    result = harness.verify_test_environment(
+        workspace,
+        _python_repo(tmp_path),
+        command,
+        verification_python=interpreter,
+    )
+
+    assert result["ready"] is True
+    assert commands
+    for executed in commands:
+        assert interpreter in executed
+        assert wrapper in executed
+        assert not executed.startswith("python")
+
+
+def test_non_python_commands_are_not_python_runners():
+    assert harness._python_runner(["npm", "test"]) is False
+    assert harness._python_runner(["python", "-m", "pytest", "-q"]) is True
+
+
+def test_invalid_python_command_resolution_is_not_silent():
+    with pytest.raises(ValueError, match="does not identify a Python interpreter"):
+        harness.resolve_selected_interpreter("pytest -q")
+    with pytest.raises(ValueError, match="Unqualified interpreter"):
+        harness._validated_interpreter("python3")
+
+
+def test_python_test_command_normalization_uses_configured_interpreter():
+    assert (
+        harness.normalize_python_test_command("pytest -q", "/workspace/.venv/bin/python")
+        == "/workspace/.venv/bin/python -m pytest -q"
+    )
+    assert (
+        harness.normalize_python_test_command(".venv/bin/python -m pytest -q", ".venv/bin/python")
+        == ".venv/bin/python -m pytest -q"
+    )
+
+
+def test_pipenv_env_is_forced_in_sandbox_command_without_changing_interpreter():
+    command = harness.sandbox_test_command(
+        "pipenv run /workspace/.venv/bin/python -m pytest -q"
+    )
+
+    assert "PIPENV_DONT_LOAD_ENV=1" in command
+    assert "PIPENV_DONT_LOAD_ENV=" in command
+    assert "PIPENV_DONT_LOAD_ENV=0" not in command
+    assert command.endswith(
+        "pipenv run /workspace/.venv/bin/python -m pytest -q"
+    )
+
+
+def test_pipenv_env_is_present_in_verification_and_collection(tmp_path):
+    interpreter = "/workspace/.venv/bin/python"
+    workspace, commands = _recording_interpreter_workspace(interpreter)
+
+    result = harness.verify_test_environment(
+        workspace,
+        _python_repo(tmp_path),
+        "pipenv run python -m pytest -q",
+        verification_python=interpreter,
+    )
+
+    assert result["ready"] is True
+    assert commands
+    for command in commands:
+        assert "PIPENV_DONT_LOAD_ENV=1" in command
+        assert f"pipenv run {interpreter}" in command
+    assert any("--collect-only" in command for command in commands)
+
+
+def test_pipenv_env_is_present_in_repair_execution():
+    test_command = harness.sandbox_test_command(
+        "pipenv run /workspace/.venv/bin/python -m pytest -q"
+    )
+    commands = []
+
+    class Workspace:
+        def execute_command(self, command, timeout=1200):
+            commands.append(command)
+            return SimpleNamespace(exit_code=0, stdout="1 passed", stderr="")
+
+    class Conversation:
+        def send_message(self, message):
+            return None
+
+        def run(self):
+            return None
+
+    result, attempts = harness.run_repair_loop(
+        Workspace(), Conversation(), test_command, 0
+    )
+
+    assert result.exit_code == 0
+    assert attempts[0]["command"] == test_command
+    assert commands == [test_command]
+    assert "PIPENV_DONT_LOAD_ENV=1" in commands[0]
+    assert "pipenv run /workspace/.venv/bin/python -m pytest -q" in commands[0]
 
 
 def test_resolve_public_rejects_any_private_answer(monkeypatch):
