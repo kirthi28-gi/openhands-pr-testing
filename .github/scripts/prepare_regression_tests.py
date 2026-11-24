@@ -66,7 +66,7 @@ def prepare(regression_repo, output):
             )
 
         pr_number = metadata.get("source_pr_number")
-        if not isinstance(pr_number, int) or pr_number < 1:
+        if type(pr_number) is not int or pr_number < 1:
             raise RuntimeError(f"Invalid PR number in {metadata_file.name}")
 
         if metadata_file.stem != f"PR-{pr_number}":

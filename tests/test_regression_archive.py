@@ -382,3 +382,12 @@ def test_extract_rejects_invalid_archive(tmp_path):
 
     with pytest.raises(tarfile.ReadError):
         extract(archive, tmp_path)
+
+
+def test_prepare_rejects_boolean_pr_number(tmp_path):
+    repo = tmp_path / "regression"
+    _write_metadata(repo, source_pr_number=True)
+    _write_test(repo)
+
+    with pytest.raises(RuntimeError, match="Invalid PR number"):
+        prepare(repo, tmp_path / "approved.tar.gz")
