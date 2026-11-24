@@ -1710,9 +1710,12 @@ def environment_ready_from_report(report: dict) -> bool:
 
 
 def update_validation_marker(marker: Path, report: dict) -> bool:
-    """Create the marker only after a report has no structural/evidence errors."""
+    """Create the marker only when both validation stages are clean."""
     errors = report.get("report_validation_errors")
-    if isinstance(errors, list) and not errors:
+    diff_errors = report.get("application_diff_errors")
+    schema_ok = isinstance(errors, list) and not errors
+    diff_ok = not (isinstance(diff_errors, list) and diff_errors)
+    if schema_ok and diff_ok and report.get("report_valid", True):
         marker.touch()
         return True
     marker.unlink(missing_ok=True)
@@ -1962,9 +1965,22 @@ def ensure_failure_artifacts(
     )
     if not report_was_validated:
         limitations = report.get("limitations", [])
-        report["report_validation_errors"] = [
-            "Agent report was not validated against captured test output."
+        # Specific errors (for example a failed application diff capture) are
+        # stronger evidence than the generic fallback message. Preserve them
+        # and never relabel a diff-capture failure as a schema failure.
+        specific_errors = [
+            values
+            for values in (
+                report.get("report_validation_errors"),
+                report.get("application_diff_errors"),
+            )
+            if isinstance(values, list)
+            and any(isinstance(item, str) and item.strip() for item in values)
         ]
+        if not specific_errors:
+            report["report_validation_errors"] = [
+                "Agent report was not validated against captured test output."
+            ]
         report["failures"] = []
         report["root_causes"] = []
         report["dependency_installation_failures"] = []

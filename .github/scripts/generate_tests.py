@@ -340,6 +340,66 @@ def write_summary_text(summary_path: str | None, text: str) -> None:
         summary.write(text)
 
 
+PATCH_CAPTURE_ERROR = "Sandbox application diff could not be captured as a valid patch."
+
+
+def agent_report_valid(report: dict) -> bool:
+    """Schema/evidence validity of the agent report, independent of diff capture."""
+    if not isinstance(report, dict):
+        return False
+    if "agent_report_valid" in report:
+        return bool(report["agent_report_valid"])
+    return bool(report.get("report_valid", False))
+
+
+def finalize_report_validity(
+    report: dict, patch_capture_valid: bool, patch_error: str = PATCH_CAPTURE_ERROR
+) -> None:
+    """Keep report-schema validity and diff-capture validity as separate stages."""
+    errors = report.get("report_validation_errors")
+    if not isinstance(errors, list):
+        errors = []
+        report["report_validation_errors"] = errors
+    schema_valid = not errors
+    report["agent_report_valid"] = schema_valid
+    report["application_diff_valid"] = bool(patch_capture_valid)
+    report["report_valid"] = schema_valid and bool(patch_capture_valid)
+    # Diff-capture errors never enter the agent-report schema/evidence list.
+    report["application_diff_errors"] = [] if patch_capture_valid else [patch_error]
+
+
+def completion_failure_reason(report: dict) -> str | None:
+    """Distinguish a schema/evidence failure from a diff-capture failure."""
+    if not agent_report_valid(report):
+        return "Agent report failed schema or evidence validation."
+    if not report.get("application_diff_valid", True):
+        return (
+            "Application diff capture failed. See application_diff_errors "
+            "in the report artifact."
+        )
+    return None
+
+
+def fallback_validation_errors(output_dir: Path) -> list[str]:
+    """Read preserved validation error details from the fallback report."""
+    result: list[str] = []
+    report_path = output_dir / "openhands-report.json"
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return result
+    if not isinstance(data, dict):
+        return result
+    for key in ("report_validation_errors", "application_diff_errors"):
+        values = data.get(key)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, str) and value.strip() and value not in result:
+                result.append(value)
+    return result
+
+
 def normal_summary_text(
     pr_number,
     base_sha,
@@ -363,7 +423,9 @@ def normal_summary_text(
         f"- Failure evidence: "
         f"{((report.get('failure_classification') or {}).get('evidence') or ['none'])[0]}\n"
         f"- Attempts: {len(attempt_records)}\n\n"
-        f"- Agent report valid: {'yes' if report['report_valid'] else 'no'}\n"
+        f"- Agent report valid: {'yes' if agent_report_valid(report) else 'no'}\n"
+        f"- Application diff valid: "
+        f"{'yes' if report.get('application_diff_valid', True) else 'no'}\n"
         f"- Private regression corpus: "
         f"{'structure-validated on trusted host; NOT executed against PR code' if report.get('regression_corpus', {}).get('valid') else 'not validated'}\n\n"
         f"### Repository test results\n\n"
@@ -373,19 +435,31 @@ def normal_summary_text(
 
 
 def fallback_summary_text(
-    error_name: str, final_category, workflow_category, failure_classification=None
+    error_name: str,
+    final_category,
+    workflow_category,
+    failure_classification=None,
+    validation_errors=None,
 ) -> str:
     """Render the exception/fallback GitHub Actions summary."""
     classification = failure_classification or {}
-    return (
-        "\n## OpenHands PR Test Report\n\n"
-        f"- Result: Failed before verified completion ({error_name}).\n"
-        f"- Failure category: {final_category or 'none'}\n"
-        f"- Workflow failure category: {workflow_category or 'none'}\n"
-        f"- Failure class: {classification.get('category', 'none')}\n"
-        f"- Failure evidence: {(classification.get('evidence') or ['none'])[0]}\n"
-        "- A failure report and generated-tests artifact were retained.\n"
-    )
+    lines = [
+        "## OpenHands PR Test Report",
+        "",
+        f"- Result: Failed before verified completion ({error_name}).",
+        f"- Failure category: {final_category or 'none'}",
+        f"- Workflow failure category: {workflow_category or 'none'}",
+        f"- Failure class: {classification.get('category', 'none')}",
+        f"- Failure evidence: {(classification.get('evidence') or ['none'])[0]}",
+    ]
+    if isinstance(validation_errors, list):
+        specific = [item for item in validation_errors if isinstance(item, str) and item.strip()]
+        if specific:
+            lines.extend(
+                ["- Validation errors:", *[f"  - {item}" for item in specific]]
+            )
+    lines.append("- A failure report and generated-tests artifact were retained.")
+    return "\n" + "\n".join(lines) + "\n"
 
 
 def fallback_report_categories(output_dir: Path) -> tuple[str, str]:
@@ -798,6 +872,29 @@ def sandbox_application_unchanged(workspace) -> dict:
             (result.stdout or "") + "\n" + (result.stderr or "")
         )[-4000:],
     }
+
+
+def application_diff_capture_command() -> str:
+    """Build the final sandbox command that captures the application diff.
+
+    Bytecode and pytest caches are excluded for the same reason the integrity
+    guard excludes them: they are generated artifacts, not application source.
+    All real source files (including binary ones) are still compared.
+    """
+    return (
+        "diff -ruN "
+        "--exclude=.git --exclude=.venv --exclude=node_modules "
+        "--exclude=__pycache__ --exclude=.pytest_cache "
+        "--exclude=target --exclude=build --exclude=dist "
+        "--exclude=tests/generated --exclude=PR_DIFF.md "
+        "--exclude=.openhands_environment_ready "
+        "--exclude=openhands-test-command --exclude=openhands-report.json "
+        "--exclude=openhands-application.patch "
+        "--exclude=openhands-application.raw.patch --exclude=generated-tests.tar.gz "
+        "/tmp/openhands-pr-baseline /workspace "
+        "> /tmp/openhands-pr-diff; code=$?; "
+        "test $code -le 1"
+    )
 
 
 def run_checked(workspace, command, timeout=600):
@@ -1588,17 +1685,7 @@ Do not stop after describing the tests. Create the files.
             # Preserve an exact sandbox-only patch for review, including when
             # environment preparation or an agent repair failed.
             patch_capture = workspace.execute_command(
-                "diff -ruN "
-                "--exclude=.git --exclude=.venv --exclude=node_modules "
-                "--exclude=target --exclude=build --exclude=dist "
-                "--exclude=tests/generated --exclude=PR_DIFF.md "
-                "--exclude=.openhands_environment_ready "
-                "--exclude=openhands-test-command --exclude=openhands-report.json "
-                "--exclude=openhands-application.patch "
-                "--exclude=openhands-application.raw.patch --exclude=generated-tests.tar.gz "
-                "/tmp/openhands-pr-baseline /workspace "
-                "> /tmp/openhands-pr-diff; code=$?; "
-                "test $code -le 1",
+                application_diff_capture_command(),
                 timeout=120,
             )
             if patch_capture.exit_code != 0:
@@ -1697,7 +1784,6 @@ Do not stop after describing the tests. Create the files.
                         and cause.get("attempt") in unclassified_attempts
                     )
                 ]
-            report_valid = not report["report_validation_errors"]
             validation_marker.unlink(missing_ok=True)
             patch_path = output_dir / "openhands-application.patch"
             patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
@@ -1767,8 +1853,6 @@ Do not stop after describing the tests. Create the files.
                 },
                 "result": "passed" if test_result.exit_code == 0 else "failed",
                 "harness_result": "passed" if test_result.exit_code == 0 else "failed",
-                "report_valid": report_valid and patch_capture_valid,
-                "application_diff_valid": patch_capture_valid,
                 "harness_final_exit_code": test_result.exit_code,
                 "environment_ready": environment_ready,
                 "validated_test_command": validated_command,
@@ -1813,10 +1897,7 @@ Do not stop after describing the tests. Create the files.
                     "note": "Only this repository run is represented; cross-ecosystem compatibility is not established.",
                 },
             })
-            if not patch_capture_valid:
-                report["report_validation_errors"].append(
-                    "Sandbox application diff could not be captured as a valid patch."
-                )
+            finalize_report_validity(report, patch_capture_valid)
             repair_history_path = output_dir / "openhands-repair-history.json"
             repair_history_path.write_text(
                 json.dumps(report["repair_history"], indent=2), encoding="utf-8"
@@ -1834,7 +1915,7 @@ Do not stop after describing the tests. Create the files.
                 "final_stderr": test_result.stderr or "",
             }, indent=2), encoding="utf-8")
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            report_valid = update_validation_marker(validation_marker, report)
+            update_validation_marker(validation_marker, report)
 
             # Save the diagnosis before packaging test files so a packaging
             # error cannot erase the machine-readable failure report.
@@ -1933,10 +2014,9 @@ Do not stop after describing the tests. Create the files.
                     "Repository test command reported failures. "
                     "See the GitHub Actions logs for details."
                 )
-            if not report["report_valid"]:
-                raise RuntimeError(
-                    "Agent report failed schema or evidence validation."
-                )
+            failure_reason = completion_failure_reason(report)
+            if failure_reason:
+                raise RuntimeError(failure_reason)
 
             validation_marker.unlink(missing_ok=True)
             print("OpenHands test generation and execution completed.")
@@ -1962,6 +2042,7 @@ def main():
                 final_category,
                 workflow_category,
                 fallback_failure_classification(output_dir),
+                validation_errors=fallback_validation_errors(output_dir),
             ),
         )
         raise
