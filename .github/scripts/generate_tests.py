@@ -657,9 +657,7 @@ test file, never edit the trusted module itself.
 
 {GENERATED_TEST_IMPORT_RULE}
 
-You must NOT modify application code, existing repository tests, pre-existing
-generated tests, dependency manifests, lockfiles, test configuration, or any
-trusted automation. You must NOT delete, skip, rename, weaken, or remove a
+You must NOT modify application code, existing repository tests, pre-existing generated tests, dependency manifests, lockfiles, test configuration, or any trusted automation. You must NOT delete, skip, rename, weaken, or remove a
 failing test. Do not change the validation command.
 
 If the failure appears to expose a genuine application bug, preserve the test
