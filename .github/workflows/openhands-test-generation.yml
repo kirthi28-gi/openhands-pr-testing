@@ -36,10 +36,28 @@ jobs:
           persist-credentials: false
           path: pr-source
 
+      - name: Checkout approved regression tests
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REGRESSION_TESTS_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.REGRESSION_TESTS_TOKEN }}
+          path: regression-source
+          persist-credentials: false
+
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Prepare approved regression tests
+        run: |
+          mkdir -p trusted/regression-input
+          python trusted/.github/scripts/prepare_regression_tests.py \
+            --regression-repo regression-source \
+            --output trusted/regression-input/approved-regression-tests.tar.gz
+
 
       - name: Prepare PR diff
         env:
@@ -90,6 +108,102 @@ jobs:
                   print(f"{method_name}: {inspect.signature(method)}")
           PYCODE
 
+      - name: Configure isolated sandbox network
+        env:
+          PACKAGE_PROXY_ALLOWLIST: >-
+            pypi.org,files.pythonhosted.org,registry.npmjs.org,registry.yarnpkg.com,
+            deb.debian.org,security.debian.org,archive.ubuntu.com,security.ubuntu.com
+          OH_SANDBOX_NETWORK: oh-pr-sandbox
+          OH_SANDBOX_SUBNET: 172.28.0.0/16
+          OH_SANDBOX_GATEWAY: 172.28.0.1
+          PACKAGE_PROXY_PORT: '3128'
+        run: |
+          set -euo pipefail
+          python trusted/.github/scripts/sandbox_network.py --configure
+          nohup python trusted/.github/scripts/package_proxy.py \
+            --host "$OH_SANDBOX_GATEWAY" \
+            --port "$PACKAGE_PROXY_PORT" \
+            --allowlist "$PACKAGE_PROXY_ALLOWLIST" \
+            > package-proxy.log 2>&1 &
+          echo $! > package-proxy.pid
+          for _ in $(seq 1 20); do
+            if curl -sf --max-time 3 \
+              -x "http://${OH_SANDBOX_GATEWAY}:${PACKAGE_PROXY_PORT}" \
+              https://pypi.org/simple/ >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf --max-time 3 \
+            -x "http://${OH_SANDBOX_GATEWAY}:${PACKAGE_PROXY_PORT}" \
+            https://pypi.org/simple/ >/dev/null; then
+            echo "Package proxy is unavailable; failing closed."
+            exit 1
+          fi
+
+      - name: Verify sandbox network isolation
+        env:
+          CONTROL_PORT: '39991'
+          HOST_PROBE_PORT: '39996'
+        run: |
+          set -euo pipefail
+          docker rm -f oh-control-probe oh-target-probe >/dev/null 2>&1 || true
+          docker run -d --rm --name oh-control-probe --network "$OH_SANDBOX_NETWORK" \
+            -p "127.0.0.1:${CONTROL_PORT}:8000" \
+            python:3.12-slim python -m http.server 8000 --bind 0.0.0.0 >/dev/null
+          for _ in $(seq 1 20); do
+            if curl -sf --max-time 2 "http://127.0.0.1:${CONTROL_PORT}/" >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf --max-time 3 "http://127.0.0.1:${CONTROL_PORT}/" >/dev/null \
+            || { echo "control-channel probe failed"; exit 1; }
+
+          docker run -d --rm --name oh-target-probe --network "$OH_SANDBOX_NETWORK" \
+            python:3.12-slim python -m http.server 8000 --bind 0.0.0.0 >/dev/null
+          TARGET_IP=$(docker inspect -f \
+            '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' oh-target-probe)
+
+          if docker run --rm --network "$OH_SANDBOX_NETWORK" curlimages/curl \
+            -sf --max-time 5 https://api.github.com >/dev/null 2>&1; then
+            echo "public-internet probe failed"; exit 1
+          fi
+          if docker run --rm --network "$OH_SANDBOX_NETWORK" curlimages/curl \
+            -sf --max-time 5 http://169.254.169.254/latest/meta-data/ >/dev/null 2>&1; then
+            echo "metadata probe failed"; exit 1
+          fi
+          if docker run --rm --network "$OH_SANDBOX_NETWORK" python:3.12-slim \
+            python -c 'import pathlib,sys; lines=[l for l in pathlib.Path("/proc/net/if_inet6").read_text().splitlines()[1:] if l.split()[1] != "01"]; print(lines); sys.exit(1 if lines else 0)'; then
+            echo "IPv6 address probe failed"; exit 1
+          fi
+          if docker run --rm --network "$OH_SANDBOX_NETWORK" python:3.12-slim \
+            python -c 'import socket,sys; s=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); s.settimeout(2); code=s.connect_ex(("2001:4860:4860::8888",443)); sys.exit(0 if code == 0 else 1)'; then
+            echo "IPv6 egress probe failed"; exit 1
+          fi
+          if docker run --rm --network "$OH_SANDBOX_NETWORK" curlimages/curl \
+            -sf --max-time 5 "http://${TARGET_IP}:8000/" >/dev/null 2>&1; then
+            echo "container-isolation probe failed"; exit 1
+          fi
+
+          python3 -m http.server "${HOST_PROBE_PORT}" --bind 0.0.0.0 >/dev/null 2>&1 &
+          HOST_PID=$!
+          sleep 1
+          if docker run --rm --network "$OH_SANDBOX_NETWORK" curlimages/curl \
+            -sf --max-time 5 "http://${OH_SANDBOX_GATEWAY}:${HOST_PROBE_PORT}/" \
+            >/dev/null 2>&1; then
+            echo "host-gateway probe failed"; kill "$HOST_PID"; exit 1
+          fi
+          kill "$HOST_PID"
+
+          docker run --rm --network "$OH_SANDBOX_NETWORK" curlimages/curl \
+            -sf --max-time 10 -x "http://${OH_SANDBOX_GATEWAY}:${PACKAGE_PROXY_PORT}" \
+            https://pypi.org/simple/ >/dev/null \
+            || { echo "package-proxy probe failed"; exit 1; }
+
+          docker rm -f oh-control-probe oh-target-probe >/dev/null 2>&1 || true
+          echo "Sandbox network isolation probes passed."
+
       - name: Generate and execute tests in OpenHands sandbox
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -117,3 +231,13 @@ jobs:
           path: trusted/generated-tests/
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Cleanup isolated sandbox network
+        if: always()
+        run: |
+          python trusted/.github/scripts/sandbox_network.py --cleanup
+          if [ -f package-proxy.pid ]; then
+            kill "$(cat package-proxy.pid)" 2>/dev/null || true
+            rm -f package-proxy.pid
+          fi
+          docker rm -f oh-control-probe oh-target-probe >/dev/null 2>&1 || true
