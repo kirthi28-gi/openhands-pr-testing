@@ -24,6 +24,7 @@ from pr_test_harness import (
     DIAGNOSIS_EXAMPLE,
     GENERATED_TEST_IMPORT_RULE,
     _python_runner,
+    application_diff_command,
     classify_failure,
     REPORT_EVIDENCE_RULE,
     SCHEMA_HINT,
@@ -850,19 +851,7 @@ def read_suspected_bugs(workspace, temp_dir: Path, output: str | None = None) ->
 def sandbox_application_unchanged(workspace) -> dict:
     """Detect application-code changes outside generated tests and metadata."""
     diff_path = "/tmp/openhands-generated-validation.diff"
-    command = (
-        "diff -ruN "
-        "--exclude=.git --exclude=.venv --exclude=node_modules "
-        "--exclude=__pycache__ --exclude=.pytest_cache "
-        "--exclude=target --exclude=build --exclude=dist "
-        "--exclude=tests/generated --exclude=PR_DIFF.md "
-        "--exclude=openhands-test-command --exclude=openhands-report.json "
-        "--exclude=openhands-suspected-bugs.json "
-        "--exclude=openhands-application.patch "
-        "--exclude=openhands-application.raw.patch --exclude=generated-tests.tar.gz "
-        f"/tmp/openhands-pr-baseline /workspace > {diff_path}; "
-        f"code=$?; test $code -le 1 && test ! -s {diff_path}"
-    )
+    command = application_diff_command(diff_path, require_empty=True)
     result = workspace.execute_command(command, timeout=120)
     return {
         "unchanged": result.exit_code == 0,
@@ -873,26 +862,8 @@ def sandbox_application_unchanged(workspace) -> dict:
 
 
 def application_diff_capture_command() -> str:
-    """Build the final sandbox command that captures the application diff.
-
-    Bytecode and pytest caches are excluded for the same reason the integrity
-    guard excludes them: they are generated artifacts, not application source.
-    All real source files (including binary ones) are still compared.
-    """
-    return (
-        "diff -ruN "
-        "--exclude=.git --exclude=.venv --exclude=node_modules "
-        "--exclude=__pycache__ --exclude=.pytest_cache "
-        "--exclude=target --exclude=build --exclude=dist "
-        "--exclude=tests/generated --exclude=PR_DIFF.md "
-        "--exclude=.openhands_environment_ready "
-        "--exclude=openhands-test-command --exclude=openhands-report.json "
-        "--exclude=openhands-application.patch "
-        "--exclude=openhands-application.raw.patch --exclude=generated-tests.tar.gz "
-        "/tmp/openhands-pr-baseline /workspace "
-        "> /tmp/openhands-pr-diff; code=$?; "
-        "test $code -le 1"
-    )
+    """Final patch-capture command, built from the shared exclusion source."""
+    return application_diff_command("/tmp/openhands-pr-diff")
 
 
 def run_checked(workspace, command, timeout=600):
@@ -1716,7 +1687,8 @@ Do not stop after describing the tests. Create the files.
                         encoding="utf-8",
                     )
                 except (OSError, ValueError) as exc:
-                    agent_error = agent_error or type(exc).__name__
+                    # Preserve the exact validator failure, not just its type.
+                    agent_error = agent_error or f"{type(exc).__name__}: {exc}"
                     patch_capture_valid = False
                     patch_path.write_text("", encoding="utf-8")
             else:

@@ -132,6 +132,36 @@ SANDBOX_ENV_ALLOWLIST = {
 # otherwise load a PR-controlled .env file and could inject PYTHONPATH.
 FORCED_SANDBOX_ENV = {"PIPENV_DONT_LOAD_ENV": "1"}
 
+# Single source of truth for the sandbox application diff. Both the integrity
+# guard and the final patch capture must exclude exactly the same generated
+# artifacts; divergence here previously let pytest bytecode trigger a binary
+# diff ValueError in only one of the two commands.
+APPLICATION_DIFF_ROOTS = ("/tmp/openhands-pr-baseline", "/workspace")
+APPLICATION_DIFF_EXCLUDES = (
+    "--exclude=.git --exclude=.venv --exclude=node_modules "
+    "--exclude=__pycache__ --exclude=.pytest_cache "
+    "--exclude=target --exclude=build --exclude=dist "
+    "--exclude=tests/generated --exclude=PR_DIFF.md "
+    "--exclude=.openhands_environment_ready "
+    "--exclude=openhands-test-command --exclude=openhands-report.json "
+    "--exclude=openhands-suspected-bugs.json "
+    "--exclude=openhands-application.patch "
+    "--exclude=openhands-application.raw.patch --exclude=generated-tests.tar.gz "
+)
+
+
+def application_diff_command(output_path: str, require_empty: bool = False) -> str:
+    """Build a sandbox diff command with the shared exclusion set."""
+    original_root, modified_root = APPLICATION_DIFF_ROOTS
+    command = (
+        f"diff -ruN {APPLICATION_DIFF_EXCLUDES}"
+        f"{original_root} {modified_root} > {shlex.quote(output_path)}; "
+        "code=$?; test $code -le 1"
+    )
+    if require_empty:
+        command += f" && test ! -s {shlex.quote(output_path)}"
+    return command
+
 _SHELL_OPERATOR_CHARS = ";&|<>\n\r\x00"
 _SHELL_EXPANSION_CHARS = "*?[]{}~"
 _FORBIDDEN_COMMANDS = {

@@ -432,6 +432,101 @@ def _run_pipeline(
     }
 
 
+def test_diff_commands_share_one_exclusion_source():
+    capture = gt.application_diff_capture_command()
+    assert capture == harness.application_diff_command("/tmp/openhands-pr-diff")
+
+    commands = []
+
+    class Workspace:
+        def execute_command(self, command, timeout=120):
+            commands.append(command)
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    gt.sandbox_application_unchanged(Workspace())
+    guard = commands[0]
+    assert guard == harness.application_diff_command(
+        "/tmp/openhands-generated-validation.diff", require_empty=True
+    )
+    for flag in (
+        "--exclude=__pycache__", "--exclude=.pytest_cache",
+        "--exclude=openhands-suspected-bugs.json",
+        "--exclude=.openhands_environment_ready",
+    ):
+        assert flag in capture
+        assert flag in guard
+    # Only the integrity guard requires an empty diff.
+    assert "test ! -s" in guard
+    assert "test ! -s" not in capture
+
+def test_main_success_with_empty_diff_uses_shared_command(tmp_path, monkeypatch):
+    result = _run_pipeline(tmp_path, monkeypatch, _passing_report(), "")
+    assert result["error"] is None
+    patch_commands = [c for c in result["commands"] if c.startswith("diff -ruN ")]
+    assert patch_commands == [harness.application_diff_command("/tmp/openhands-pr-diff")]
+    assert result["report"]["application_diff_valid"] is True
+    assert result["report"]["report_valid"] is True
+    assert result["report"]["application_diff_errors"] == []
+
+def test_main_success_with_valid_text_diff(tmp_path, monkeypatch):
+    text_diff = (
+        "diff -ruN /tmp/openhands-pr-baseline/app.py /workspace/app.py\n"
+        "--- /tmp/openhands-pr-baseline/app.py\n"
+        "+++ /workspace/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-x = 1\n"
+        "+x = 2\n"
+    )
+    result = _run_pipeline(tmp_path, monkeypatch, _passing_report(), text_diff)
+    assert result["error"] is None
+    assert result["report"]["application_diff_valid"] is True
+    assert "app.py" in (result["report"]["modified_files"] or [])
+
+def test_real_diff_command_excludes_cache_files_and_keeps_source_changes(tmp_path):
+    import subprocess
+
+    base = tmp_path / "base"
+    work = tmp_path / "work"
+    output = tmp_path / "app.diff"
+    for root in (base, work):
+        (root / "tests/generated/__pycache__").mkdir(parents=True)
+        (root / "tests/generated/test_x.pyc").write_bytes(b"\x00\x01\x02")
+        (root / "app.py").write_text("x = 1\n")
+    (work / "app.py").write_text("x = 2\n")
+
+    command = (
+        harness.application_diff_command(str(output))
+        .replace("/tmp/openhands-pr-baseline", str(base))
+        .replace("/workspace", str(work))
+    )
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    diff = output.read_text(encoding="utf-8")
+
+    assert result.returncode == 0
+    assert "app.py" in diff
+    assert "-x = 1" in diff and "+x = 2" in diff
+    assert ".pyc" not in diff
+    assert not any(line.startswith("Binary files ") for line in diff.splitlines())
+
+def test_main_binary_source_change_fails_closed_with_exact_message(tmp_path, monkeypatch):
+    binary_source_diff = (
+        "diff -ruN /tmp/openhands-pr-baseline/assets/logo.png "
+        "/workspace/assets/logo.png\n"
+        "Binary files /tmp/openhands-pr-baseline/assets/logo.png and "
+        "/workspace/assets/logo.png differ\n"
+    )
+    result = _run_pipeline(tmp_path, monkeypatch, _passing_report(), binary_source_diff)
+
+    assert isinstance(result["error"], RuntimeError)
+    assert "Application diff capture failed" in str(result["error"])
+    report = result["report"]
+    assert report["application_diff_valid"] is False
+    assert report["report_valid"] is False
+    assert report["runner_error"] == (
+        "ValueError: binary application changes cannot be represented "
+        "by this text patch generator"
+    )
+
 def test_main_invokes_diff_capture_with_cache_exclusions(tmp_path, monkeypatch):
     result = _run_pipeline(tmp_path, monkeypatch, _passing_report())
 
