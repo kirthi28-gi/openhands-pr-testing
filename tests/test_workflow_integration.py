@@ -116,3 +116,46 @@ def test_publisher_rejects_report_for_another_repository():
     report = sample_report(target_repository="other/repo")
     with pytest.raises(pub.PublisherError, match="target repository"):
         publish(report=report)
+
+
+def publisher_condition():
+    return data["jobs"]["publish-results"]["if"].strip()
+
+
+def publisher_runs(event_name, publish_comments):
+    """Evaluate the documented gate for the three supported event scenarios."""
+    condition = publisher_condition()
+    assert condition.startswith("${{") and condition.endswith("}}")
+    assert "always()" in condition
+    assert "github.event_name != 'workflow_dispatch'" in condition
+    assert "inputs.publish_comments == true" in condition
+    return event_name != "workflow_dispatch" or publish_comments is True
+
+
+def test_publish_comments_dispatch_input_defaults_to_false():
+    inputs = data[True]["workflow_dispatch"]["inputs"]
+    setting = inputs["publish_comments"]
+    assert setting["type"] == "boolean"
+    assert setting["required"] is False
+    assert setting["default"] is False
+
+
+def test_external_dispatch_without_comments_is_artifact_only():
+    assert publisher_runs("workflow_dispatch", False) is False
+
+    upload = step_by_name("generate-tests", "Upload generated tests")
+    assert upload["if"] == "always()"
+    generate = step_by_name("generate-tests", "Generate and execute tests in OpenHands sandbox")
+    assert "GH_TOKEN" not in generate["env"]
+    assert "GITHUB_TOKEN" not in generate["env"]
+    assert "publish_comments" not in generate["run"]
+    assert "publish_comments" not in generate["env"]
+
+
+def test_external_dispatch_with_comments_enabled_runs_publisher():
+    assert publisher_runs("workflow_dispatch", True) is True
+
+
+def test_same_repository_pr_event_still_publishes():
+    assert publisher_runs("pull_request_target", False) is True
+    assert publisher_runs("pull_request_target", True) is True
