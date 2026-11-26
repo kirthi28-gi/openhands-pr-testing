@@ -459,6 +459,51 @@ def test_diff_commands_share_one_exclusion_source():
     assert "test ! -s" in guard
     assert "test ! -s" not in capture
 
+
+def test_category_helpers_share_one_resolver():
+    cases = [
+        ({"environment_ready": True}, [{"attempt": 1, "exit_code": 0}], True),
+        ({"environment_ready": False}, [], False),
+        ({"failures": [], "dependency_installation_failures": [{"name": "p"}]}, [], False),
+        ({"failures": [], "repair_history": [{
+            "attempt": 1,
+            "repair_decision_reason": "Diagnosis rejected: evidence mismatch",
+        }]}, [{"attempt": 1, "exit_code": 1}], True),
+    ]
+    for report, attempts, ready in cases:
+        shared = harness.failure_categories(report, attempts, ready)
+        assert gt.report_failure_categories(report, attempts, ready) == shared
+        assert harness.final_failure_category(report, attempts, ready) == shared[0]
+        assert harness.workflow_failure_category(report, ready, attempts) == shared[1]
+
+    # A healthy, passing run must not be classified as an environment failure.
+    assert gt.report_failure_categories(
+        {}, [{"attempt": 1, "exit_code": 0}], True
+    ) == (None, "unknown")
+
+
+def test_quarantine_aggregation_has_one_implementation():
+    assert gt.quarantined_tests_from_attempts is harness.quarantined_tests_from_attempts
+    attempts = [{
+        "attempt": 1,
+        "quarantined_test": "tests/generated/test_x.py::test_x",
+        "quarantine_reason": "invalid generated test",
+        "quarantine_evidence": ["exact output"],
+        "quarantine_status": "pending_rerun",
+    }]
+    assert gt.quarantined_tests_from_attempts(attempts) == [
+        {
+            "attempt": 1,
+            "test": "tests/generated/test_x.py::test_x",
+            "reason": "invalid generated test",
+            "evidence": ["exact output"],
+            "status": "pending_rerun",
+        }
+    ]
+
+
+
+
 def test_main_success_with_empty_diff_uses_shared_command(tmp_path, monkeypatch):
     result = _run_pipeline(tmp_path, monkeypatch, _passing_report(), "")
     assert result["error"] is None
@@ -467,6 +512,9 @@ def test_main_success_with_empty_diff_uses_shared_command(tmp_path, monkeypatch)
     assert result["report"]["application_diff_valid"] is True
     assert result["report"]["report_valid"] is True
     assert result["report"]["application_diff_errors"] == []
+
+
+
 
 def test_main_success_with_valid_text_diff(tmp_path, monkeypatch):
     text_diff = (
@@ -481,6 +529,9 @@ def test_main_success_with_valid_text_diff(tmp_path, monkeypatch):
     assert result["error"] is None
     assert result["report"]["application_diff_valid"] is True
     assert "app.py" in (result["report"]["modified_files"] or [])
+
+
+
 
 def test_real_diff_command_excludes_cache_files_and_keeps_source_changes(tmp_path):
     import subprocess
@@ -508,6 +559,9 @@ def test_real_diff_command_excludes_cache_files_and_keeps_source_changes(tmp_pat
     assert ".pyc" not in diff
     assert not any(line.startswith("Binary files ") for line in diff.splitlines())
 
+
+
+
 def test_main_binary_source_change_fails_closed_with_exact_message(tmp_path, monkeypatch):
     binary_source_diff = (
         "diff -ruN /tmp/openhands-pr-baseline/assets/logo.png "
@@ -526,6 +580,7 @@ def test_main_binary_source_change_fails_closed_with_exact_message(tmp_path, mon
         "ValueError: binary application changes cannot be represented "
         "by this text patch generator"
     )
+
 
 def test_main_invokes_diff_capture_with_cache_exclusions(tmp_path, monkeypatch):
     result = _run_pipeline(tmp_path, monkeypatch, _passing_report())
@@ -568,7 +623,8 @@ def test_main_binary_diff_fails_patch_capture_with_specific_error(tmp_path, monk
     assert report["report_valid"] is False
     assert report["application_diff_errors"] == [gt.PATCH_CAPTURE_ERROR]
     assert report["report_validation_errors"] == []
-    assert report["runner_error"] == "ValueError"
+    assert report["runner_error"].startswith("ValueError: ")
+    assert "binary application changes cannot be represented" in report["runner_error"]
     assert result["marker"] is False
     assert "- Agent report valid: yes" in result["summary"]
     assert "- Application diff valid: no" in result["summary"]

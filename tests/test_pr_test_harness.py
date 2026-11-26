@@ -104,6 +104,89 @@ def test_structured_application_diagnosis_requires_matching_evidence():
     assert bad["repair_allowed"] is False
 
 
+
+def test_valid_application_diagnosis_preserves_source_location():
+    output = (
+        "FAILED tests/test_math.py::test_add\n"
+        "E AssertionError: expected 3, got 2"
+    )
+    report = json.loads(_agent_report(
+        1,
+        "application bug",
+        ["FAILED tests/test_math.py::test_add", "expected 3, got 2"],
+    ))
+    report["failures"][0]["affected_file"] = "src/calculator.py"
+    report["failures"][0]["affected_line"] = 42
+
+    diagnosis = validate_repair_diagnosis(json.dumps(report), 1, output)
+
+    assert diagnosis["validated"] is True
+    assert diagnosis["repair_allowed"] is True
+    assert diagnosis["affected_file"] == "src/calculator.py"
+    assert diagnosis["affected_line"] == 42
+
+
+def test_missing_source_location_does_not_invalidate_diagnosis():
+    output = (
+        "FAILED tests/test_math.py::test_add\n"
+        "E AssertionError: expected 3, got 2"
+    )
+    diagnosis = validate_repair_diagnosis(
+        _agent_report(
+            1,
+            "application bug",
+            ["FAILED tests/test_math.py::test_add", "expected 3, got 2"],
+        ),
+        1,
+        output,
+    )
+
+    assert diagnosis["validated"] is True
+    assert diagnosis["repair_allowed"] is True
+    assert diagnosis["affected_file"] is None
+    assert diagnosis["affected_line"] is None
+
+
+def test_unsafe_source_location_is_ignored():
+    output = (
+        "FAILED tests/test_math.py::test_add\n"
+        "E AssertionError: expected 3, got 2"
+    )
+    report = json.loads(_agent_report(
+        1,
+        "application bug",
+        ["FAILED tests/test_math.py::test_add", "expected 3, got 2"],
+    ))
+    report["failures"][0]["affected_file"] = "../../outside.py"
+    report["failures"][0]["affected_line"] = 42
+
+    diagnosis = validate_repair_diagnosis(json.dumps(report), 1, output)
+
+    assert diagnosis["validated"] is True
+    assert diagnosis["repair_allowed"] is True
+    assert diagnosis["affected_file"] is None
+    assert diagnosis["affected_line"] is None
+
+
+def test_invalid_source_line_is_ignored():
+    output = (
+        "FAILED tests/test_math.py::test_add\n"
+        "E AssertionError: expected 3, got 2"
+    )
+    report = json.loads(_agent_report(
+        1,
+        "application bug",
+        ["FAILED tests/test_math.py::test_add", "expected 3, got 2"],
+    ))
+    report["failures"][0]["affected_file"] = "src/calculator.py"
+    report["failures"][0]["affected_line"] = True
+
+    diagnosis = validate_repair_diagnosis(json.dumps(report), 1, output)
+
+    assert diagnosis["validated"] is True
+    assert diagnosis["affected_file"] is None
+    assert diagnosis["affected_line"] is None
+
 def test_diagnosis_requires_actual_failing_test_and_root_cause_evidence():
     output = "FAILED tests/test_math.py::test_add\nE AssertionError: expected 3, got 2"
     wrong_test = json.loads(_agent_report(

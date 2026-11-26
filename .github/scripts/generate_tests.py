@@ -47,11 +47,23 @@ from pr_test_harness import (
     update_validation_marker,
     validate_test_command,
     verify_test_environment,
+    with_service_env,
     verification_import_probe,
     workflow_failure_category,
 )
 
 import pr_test_harness as harness
+
+from repository_profiles import (
+    ProfileError,
+    build_targeted_test_command,
+    load_profiles,
+    profile_for,
+    safe_test_path,
+)
+
+# Reuse the harness's canonical quarantine aggregation implementation.
+quarantined_tests_from_attempts = harness.quarantined_tests_from_attempts
 
 from pydantic import SecretStr
 
@@ -322,6 +334,81 @@ def upload_pr_source_to_workspace(workspace, archive_path: Path, automation_dir:
         )
 
 
+SERVICE_BOOTSTRAP_SCRIPT = "/workspace/bootstrap_services.py"
+SERVICE_ENV_FILE = "/workspace/.openhands-services.env"
+
+
+def bootstrap_sandbox_services(workspace, automation_dir: Path, service_profile: str) -> str:
+    """Upload and run trusted service bootstrap inside the isolated sandbox."""
+    if not re.fullmatch(r"[a-z0-9_]+", service_profile):
+        raise ProfileError("Invalid service profile name")
+
+    upload = workspace.file_upload(
+        source_path=automation_dir / ".github/scripts/bootstrap_services.py",
+        destination_path=SERVICE_BOOTSTRAP_SCRIPT,
+    )
+    if not upload.success:
+        raise RuntimeError(f"Could not upload service bootstrap: {upload.error}")
+
+    base_command = (
+        f"python {SERVICE_BOOTSTRAP_SCRIPT} "
+        f"--profile {shlex.quote(service_profile)} "
+        f"--env-file {shlex.quote(SERVICE_ENV_FILE)}"
+    )
+    result = workspace.execute_command(base_command, timeout=900)
+    if result.exit_code != 0:
+        raise RuntimeError(
+            "Trusted sandbox service bootstrap failed: "
+            + (result.stderr or result.stdout or "").strip()[:2000]
+        )
+
+    # Independent readiness check: the bootstrap's own success is not evidence.
+    check = workspace.execute_command(base_command + " --check-only", timeout=120)
+    if check.exit_code != 0:
+        raise RuntimeError(
+            "Sandbox service readiness check failed: "
+            + (check.stderr or check.stdout or "").strip()[:2000]
+        )
+    return SERVICE_ENV_FILE
+
+
+GENERATED_CONFTEST_DESTINATION = "/workspace/tests/generated/conftest.py"
+
+
+def install_generated_test_conftest(workspace, automation_dir: Path, profile) -> bool:
+    """Install a trusted Django fixture bridge before the agent starts."""
+    configured = profile.get("generated_test_conftest") if profile else None
+    if not configured:
+        return False
+    relative = Path(safe_test_path(configured))
+    source = (automation_dir / relative).resolve()
+    if not source.is_file() or source.is_symlink():
+        raise RuntimeError("Trusted generated-test conftest is missing or unsafe")
+
+    existing = workspace.execute_command(
+        f"test -e {shlex.quote(GENERATED_CONFTEST_DESTINATION)} || "
+        f"test -L {shlex.quote(GENERATED_CONFTEST_DESTINATION)}"
+    )
+    if existing.exit_code == 0:
+        raise RuntimeError(
+            "Untrusted generated-test conftest already exists; refusing to overwrite it"
+        )
+
+    upload = workspace.file_upload(
+        source_path=source,
+        destination_path=GENERATED_CONFTEST_DESTINATION,
+    )
+    if not upload.success:
+        raise RuntimeError(f"Could not install generated-test conftest: {upload.error}")
+    verified = workspace.execute_command(
+        f"test -f {shlex.quote(GENERATED_CONFTEST_DESTINATION)} && "
+        f"test ! -L {shlex.quote(GENERATED_CONFTEST_DESTINATION)}"
+    )
+    if verified.exit_code != 0:
+        raise RuntimeError("Generated-test conftest installation was not verified")
+    return True
+
+
 def report_failure_categories(report: dict, attempt_records: list, environment_ready: bool):
     """Return the final and workflow failure categories from one source."""
     final_category = final_failure_category(
@@ -491,20 +578,6 @@ def fallback_failure_classification(output_dir: Path) -> dict:
     return classification if isinstance(classification, dict) else {}
 
 
-def quarantined_tests_from_attempts(attempt_records: list) -> list:
-    """Collect quarantined generated tests from repair-loop attempt records."""
-    records = []
-    for item in attempt_records or []:
-        if not isinstance(item, dict) or not item.get("quarantined_test"):
-            continue
-        records.append({
-            "attempt": item.get("attempt"),
-            "test": item.get("quarantined_test"),
-            "reason": item.get("quarantine_reason"),
-            "evidence": item.get("quarantine_evidence", []),
-            "status": item.get("quarantine_status"),
-        })
-    return records
 
 
 DIAGNOSIS_CATEGORY_ALIASES = {
@@ -624,6 +697,62 @@ def normalize_final_agent_report(report_text: str, attempt_records: list) -> str
     return json.dumps(raw)
 
 
+def apply_validated_diagnoses(report: dict, attempt_records: list) -> dict:
+    """Merge only harness-validated diagnoses and source locations into a report."""
+    diagnosis_gate_by_attempt = {
+        item.get("attempt"): item
+        for item in attempt_records
+        if isinstance(item, dict)
+        and (
+            item.get("repair_decision") == "human_review"
+            or item.get("diagnosis")
+        )
+    }
+
+    for failure in report.get("failures", []):
+        if not isinstance(failure, dict):
+            continue
+
+        # The raw agent report is untrusted. Never retain its proposed location.
+        failure.pop("affected_file", None)
+        failure.pop("affected_line", None)
+
+        gate = diagnosis_gate_by_attempt.get(failure.get("attempt"))
+        diagnosis = gate.get("diagnosis") if isinstance(gate, dict) else None
+
+        if isinstance(diagnosis, dict) and diagnosis.get("validated"):
+            for key in (
+                "category",
+                "evidence",
+                "root_cause",
+                "failing_test",
+                "root_cause_evidence",
+                "repair_action",
+            ):
+                if key in diagnosis:
+                    failure[key] = diagnosis[key]
+
+            # Only application failures may become inline-comment candidates.
+            if diagnosis.get("category") in {"application bug", "regression"}:
+                affected_file = diagnosis.get("affected_file")
+                affected_line = diagnosis.get("affected_line")
+                if (
+                    isinstance(affected_file, str)
+                    and affected_file.strip()
+                    and isinstance(affected_line, int)
+                    and not isinstance(affected_line, bool)
+                    and affected_line > 0
+                ):
+                    failure["affected_file"] = affected_file
+                    failure["affected_line"] = affected_line
+
+        elif gate:
+            failure["reported_category"] = failure.get("category")
+            failure["category"] = "unknown"
+
+    return diagnosis_gate_by_attempt
+
+
 def validate_repair_diagnosis_compatible(report_text: str, attempt: int, output: str) -> dict:
     """Compatibility wrapper around the harness diagnosis validator."""
     normalized_report = normalize_diagnosis_report(report_text)
@@ -675,8 +804,12 @@ def validate_generated_tests(
     conversation,
     temp_dir: Path | None = None,
     integrity_guard=None,
+    service_env_file: str | None = None,
 ) -> dict:
     """Run generated tests before the final snapshot; allow at most 3 attempts."""
+    validation_command = with_service_env(
+        GENERATED_TEST_VALIDATION_COMMAND, service_env_file
+    )
     results = []
     suspected_bugs = []
     blocked = False
@@ -707,9 +840,7 @@ def validate_generated_tests(
             break
 
         try:
-            result = workspace.execute_command(
-                GENERATED_TEST_VALIDATION_COMMAND, timeout=600
-            )
+            result = workspace.execute_command(validation_command, timeout=600)
             exit_code = result.exit_code
             output = _tail((result.stdout or "") + "\n" + (result.stderr or ""))
         except Exception as exc:
@@ -718,7 +849,7 @@ def validate_generated_tests(
 
         record = {
             "attempt": attempt,
-            "command": GENERATED_TEST_VALIDATION_COMMAND,
+            "command": validation_command,
             "exit_code": exit_code,
             "output": output,
             "classification": None,
@@ -999,6 +1130,20 @@ def _main():
         print("Skipping test generation. No application changes detected.")
         return
 
+    # Repository profiles are read only from trusted automation. They are the
+    # sole source of service selection and targeted test paths.
+    target_repository = os.getenv("TARGET_REPOSITORY") or os.getenv("GITHUB_REPOSITORY", "")
+    repository_profile = profile_for(load_profiles(automation_dir), target_repository)
+    service_profile = (
+        repository_profile.get("service_profile") if repository_profile else None
+    )
+    service_env_file = SERVICE_ENV_FILE if service_profile else None
+    targeted_command, allowed_test_paths, required_test_paths = (
+        build_targeted_test_command(
+            repository_profile, changed_files, repo_path, VERIFICATION_PYTHON
+        )
+    )
+
     # Only access the API key when an LLM call is actually needed.
     api_key = os.getenv("LLM_API_KEY")
     if not api_key:
@@ -1096,6 +1241,14 @@ def _main():
             # Transfer PR source code into the isolated workspace.
             upload_pr_source_to_workspace(workspace, archive_path, automation_dir)
 
+            if service_profile:
+                bootstrap_sandbox_services(
+                    workspace, automation_dir, service_profile
+                )
+            install_generated_test_conftest(
+                workspace, automation_dir, repository_profile
+            )
+
             # The private regression corpus is never uploaded to this
             # untrusted workspace. It is validated on the trusted host above
             # and is not executed against PR code in this workflow.
@@ -1113,6 +1266,23 @@ def _main():
             conversation = Conversation(
                 agent=agent,
                 workspace=workspace,
+            )
+
+            services_note = (
+                "Trusted, temporary PostgreSQL and Valkey services are already "
+                "running on 127.0.0.1 inside this sandbox. Source "
+                f"{SERVICE_ENV_FILE} for DATABASE_URL, DATABASE_URL_REPLICA, "
+                "CACHE_URL and CELERY_BROKER_URL when running tests. Never "
+                "print or transmit those values."
+                if service_profile
+                else "No trusted local services were configured for this repository."
+            )
+            command_note = (
+                "For this repository the harness computes the test command from "
+                "trusted configuration and validated diff paths. Do not rely on "
+                "or modify /workspace/openhands-test-command; the harness ignores it."
+                if targeted_command
+                else "Write /workspace/openhands-test-command as instructed below."
             )
 
             prompt = f"""
@@ -1137,6 +1307,9 @@ It is reference material only, not executable source code.
 REPOSITORY DISCOVERY AND ENVIRONMENT PREPARATION — COMPLETE THIS FIRST
 
 Before generating tests, prepare the sandbox environment.
+
+{services_note}
+{command_note}
 
 1. Detect languages, versions, frameworks, dependency managers, lockfiles,
    build tools, CI test commands and conventions. Support Python,
@@ -1428,6 +1601,7 @@ Do not stop after describing the tests. Create the files.
                     conversation,
                     temp_dir=temp_dir,
                     integrity_guard=generated_validation_integrity_guard,
+                    service_env_file=service_env_file,
                 )
                 suspected_bugs = generated_test_validation.get("suspected_bugs", [])
                 if not generated_test_validation["valid"]:
@@ -1524,38 +1698,51 @@ Do not stop after describing the tests. Create the files.
                     environment_verification["failures"].append(message)
                     environment_verification["blockers"].append(message)
 
-                # The agent-created marker is not evidence. Independently
-                # inspect the repository-native command and sandbox state.
+                # Targeted repositories use a command built only from trusted
+                # profile data and validated diff paths. The agent's command
+                # file is never read in that mode.
                 try:
-                    run_checked(workspace,
-                        "test -f /workspace/openhands-test-command && "
-                        "test ! -L /workspace/openhands-test-command",
-                    )
-                    command_size_result = workspace.execute_command(
-                        "wc -c < /workspace/openhands-test-command"
-                    )
-                    if command_size_result.exit_code != 0:
-                        raise RuntimeError("Could not inspect test command size")
-                    try:
-                        command_size = int(command_size_result.stdout.strip())
-                    except ValueError as exc:
-                        raise RuntimeError("Could not parse test command size") from exc
-                    if command_size > 2048:
-                        raise RuntimeError("Test command exceeds the 2048-byte limit")
-                    command_result = workspace.execute_command(
-                        "cat -- /workspace/openhands-test-command"
-                    )
-                    if command_result.exit_code != 0:
-                        raise RuntimeError("Could not read test command")
-                    validated_command = validate_test_command(
-                        command_result.stdout, repo_path
-                    )
+                    if targeted_command is not None:
+                        validated_command = validate_test_command(
+                            targeted_command,
+                            repo_path,
+                            allowed_test_paths,
+                            required_test_paths,
+                        )
+                    else:
+                        run_checked(workspace,
+                            "test -f /workspace/openhands-test-command && "
+                            "test ! -L /workspace/openhands-test-command",
+                        )
+                        command_size_result = workspace.execute_command(
+                            "wc -c < /workspace/openhands-test-command"
+                        )
+                        if command_size_result.exit_code != 0:
+                            raise RuntimeError("Could not inspect test command size")
+                        try:
+                            command_size = int(command_size_result.stdout.strip())
+                        except ValueError as exc:
+                            raise RuntimeError("Could not parse test command size") from exc
+                        if command_size > 2048:
+                            raise RuntimeError("Test command exceeds the 2048-byte limit")
+                        command_result = workspace.execute_command(
+                            "cat -- /workspace/openhands-test-command"
+                        )
+                        if command_result.exit_code != 0:
+                            raise RuntimeError("Could not read test command")
+                        validated_command = validate_test_command(
+                            command_result.stdout, repo_path
+                        )
                     # Resolve exactly one interpreter for Python commands and
                     # rewrite them to use it explicitly. Collection, repair and
                     # final execution all consume validated_command. Unsupported
                     # non-Python ecosystems are left untouched; invalid Python
                     # commands must fail loudly instead of being swallowed.
-                    if _python_runner(shlex.split(validated_command)):
+                    if _python_runner(
+                        shlex.split(validated_command),
+                        allowed_test_paths,
+                        required_test_paths,
+                    ):
                         try:
                             selected_interpreter = resolve_selected_interpreter(
                                 validated_command, VERIFICATION_PYTHON
@@ -1581,6 +1768,8 @@ Do not stop after describing the tests. Create the files.
                         repo_path,
                         validated_command,
                         verification_python=VERIFICATION_PYTHON,
+                        allowed_test_paths=allowed_test_paths,
+                        required_test_paths=required_test_paths,
                     )
                     if generated_tests_manifest is None:
                         message = generated_tests_snapshot_error or "Generated-test integrity snapshot is unavailable; suite execution was blocked."
@@ -1609,6 +1798,8 @@ Do not stop after describing the tests. Create the files.
                             repo_path,
                             validated_command,
                             verification_python=VERIFICATION_PYTHON,
+                            allowed_test_paths=allowed_test_paths,
+                            required_test_paths=required_test_paths,
                         ),
                         max_attempts=int(os.getenv("MAX_ENVIRONMENT_REPAIR_ATTEMPTS", "2")),
                         integrity_guard=generated_tests_guard,
@@ -1616,7 +1807,9 @@ Do not stop after describing the tests. Create the files.
                     environment_ready = environment_verification.get("ready", False)
                 if environment_ready:
                     try:
-                        test_command = sandbox_test_command(validated_command)
+                        test_command = sandbox_test_command(
+                            validated_command, service_env_file=service_env_file
+                        )
                         test_result, attempt_records = run_repair_loop(
                             workspace,
                             conversation,
@@ -1728,21 +1921,9 @@ Do not stop after describing the tests. Create the files.
             except (OSError, UnicodeError):
                 pass
             report = load_agent_report(report_path, attempt_records)
-            diagnosis_gate_by_attempt = {
-                item.get("attempt"): item
-                for item in attempt_records
-                if item.get("repair_decision") == "human_review" or item.get("diagnosis")
-            }
-            for failure in report["failures"]:
-                gate = diagnosis_gate_by_attempt.get(failure.get("attempt"))
-                diagnosis = gate.get("diagnosis") if isinstance(gate, dict) else None
-                if isinstance(diagnosis, dict) and diagnosis.get("validated"):
-                    for key in ("category", "evidence", "root_cause", "failing_test", "root_cause_evidence"):
-                        if key in diagnosis:
-                            failure[key] = diagnosis[key]
-                elif gate:
-                    failure["reported_category"] = failure.get("category")
-                    failure["category"] = "unknown"
+            diagnosis_gate_by_attempt = apply_validated_diagnoses(
+                report, attempt_records
+            )
             unclassified_attempts = {
                 attempt for attempt, gate in diagnosis_gate_by_attempt.items()
                 if not isinstance(gate.get("diagnosis"), dict)
@@ -1791,6 +1972,10 @@ Do not stop after describing the tests. Create the files.
             )
             report.update({
                 "pr_number": pr_number,
+                "target_repository": target_repository,
+                "repository_profile": bool(repository_profile),
+                "service_profile": service_profile,
+                "targeted_test_paths": sorted(allowed_test_paths) if allowed_test_paths else [],
                 "base_sha": base_sha,
                 "head_sha": head_sha,
                 "sandbox_image": server_image,

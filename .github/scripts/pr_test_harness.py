@@ -79,6 +79,15 @@ SCHEMA_HINT = (
     "paraphrased text.\n"
     + GENERATED_TEST_IMPORT_RULE + "\n"
     + REPORT_EVIDENCE_RULE + "\n"
+    "For application_bug or regression only, optionally include "
+    "affected_file and affected_line when you can confidently identify the "
+    "actual application source location responsible for the failure from "
+    "the PR diff and repository code. affected_file must be a repository-"
+    "relative POSIX path and affected_line a positive 1-based integer. These "
+    "are candidate locations, not proof. Use null for both or omit both if "
+    "the exact application source location is uncertain. Never invent a "
+    "path or line, and do not use a generated-test path as the application "
+    "location unless that file is itself the changed application code.\n"
     "Example diagnosis entry:\n" + DIAGNOSIS_EXAMPLE
 )
 
@@ -421,15 +430,15 @@ def _lex_one_command(command: str) -> list[str]:
     return tokens
 
 
-def _python_runner(tokens: list[str]) -> bool:
+def _python_runner(tokens: list[str], allowed_paths=None, required_paths=None) -> bool:
     if not tokens:
         return False
     if tokens[0] in {"pytest", ".venv/bin/pytest", "/workspace/.venv/bin/pytest"}:
-        return _full_pytest_arguments(tokens[1:])
+        return _full_pytest_arguments(tokens[1:], allowed_paths, required_paths)
     if tokens[0] in {"python", "python3", ".venv/bin/python", "/workspace/.venv/bin/python"}:
-        return _python_module_runner(tokens[1:])
+        return _python_module_runner(tokens[1:], allowed_paths, required_paths)
     if re.fullmatch(r"python3\.\d+", tokens[0]):
-        return _python_module_runner(tokens[1:])
+        return _python_module_runner(tokens[1:], allowed_paths, required_paths)
     if tokens[0] == "uv":
         if len(tokens) < 3 or tokens[1] != "run":
             return False
@@ -438,11 +447,15 @@ def _python_runner(tokens: list[str]) -> bool:
             options = options[2:]
         if options and options[0] == "--":
             options = options[1:]
-        return _python_runner(options)
+        return _python_runner(options, allowed_paths, required_paths)
     if tokens[0] == "poetry":
-        return len(tokens) >= 3 and tokens[1] == "run" and _python_runner(tokens[2:])
+        return len(tokens) >= 3 and tokens[1] == "run" and _python_runner(
+            tokens[2:], allowed_paths, required_paths
+        )
     if tokens[0] == "pipenv":
-        return len(tokens) >= 3 and tokens[1] == "run" and _python_runner(tokens[2:])
+        return len(tokens) >= 3 and tokens[1] == "run" and _python_runner(
+            tokens[2:], allowed_paths, required_paths
+        )
     return False
 
 
@@ -454,8 +467,15 @@ _PYTEST_SWITCHES = {
 }
 
 
-def _full_pytest_arguments(arguments: list[str]) -> bool:
-    """Permit display-only pytest options; reject paths and suite selectors."""
+def _full_pytest_arguments(arguments: list[str], allowed_paths=None, required_paths=None) -> bool:
+    """Permit display-only pytest options and trusted, explicit test paths.
+
+    Positional paths are accepted only when a trusted repository profile has
+    supplied the exact allowlist. The agent cannot widen that allowlist.
+    """
+    allowed = set(allowed_paths or [])
+    required = set(required_paths or [])
+    seen_paths = set()
     index = 0
     while index < len(arguments):
         option = arguments[index]
@@ -470,15 +490,21 @@ def _full_pytest_arguments(arguments: list[str]) -> bool:
         if any(option.startswith(name + "=") for name in _PYTEST_VALUE_OPTIONS):
             index += 1
             continue
+        if allowed and option in allowed:
+            seen_paths.add(option)
+            index += 1
+            continue
+        return False
+    if required and not required.issubset(seen_paths):
         return False
     return True
 
 
-def _python_module_runner(tokens: list[str]) -> bool:
+def _python_module_runner(tokens: list[str], allowed_paths=None, required_paths=None) -> bool:
     if len(tokens) < 2 or tokens[0] != "-m":
         return False
     if tokens[1] == "pytest":
-        return _full_pytest_arguments(tokens[2:])
+        return _full_pytest_arguments(tokens[2:], allowed_paths, required_paths)
     # unittest's positional names, discovery paths, and patterns all select
     # only part of the suite. Its no-argument default discovers the suite.
     return tokens[1] == "unittest" and tokens[2:] in ([], ["-v"], ["--verbose"])
@@ -566,7 +592,9 @@ def _javascript_runner(tokens: list[str]) -> bool:
     return False
 
 
-def validate_test_command(command: str, repository_root: Path) -> str:
+def validate_test_command(
+    command: str, repository_root: Path, allowed_paths=None, required_paths=None
+) -> str:
     """Accept only one safe command matching a runner configured by the repository."""
     tokens = _lex_one_command(command)
     root = repository_root.resolve()
@@ -584,7 +612,7 @@ def validate_test_command(command: str, repository_root: Path) -> str:
         path for path in (root / "setup.cfg", root / "tox.ini") if path.is_file()
     ]
     python_configured = python_sources or bool(python_manifests) or "pytest" in pyproject_text.lower()
-    if _python_runner(tokens):
+    if _python_runner(tokens, allowed_paths, required_paths):
         if not python_configured or not (python_tests or "pytest" in pyproject_text.lower() or any("pytest" in path.read_text(errors="ignore").lower() for path in python_manifests)):
             raise ValueError("Python test runner is not evidenced by this repository's source, tests, or configuration")
         return shlex.join(tokens)
@@ -919,6 +947,8 @@ def verify_test_environment(
     repository_root: Path,
     test_command: str,
     verification_python: str | None = None,
+    allowed_test_paths=None,
+    required_test_paths=None,
 ) -> dict:
     """Independently check runtime, runner, dependency health and test discovery.
 
@@ -929,7 +959,9 @@ def verify_test_environment(
     failures: list[str] = []
     limitations: list[str] = []
     ecosystem = "unknown"
-    validated = validate_test_command(test_command, repository_root)
+    validated = validate_test_command(
+        test_command, repository_root, allowed_test_paths, required_test_paths
+    )
     tokens = shlex.split(validated)
 
     def check(name: str, argv: list[str]) -> bool:
@@ -962,7 +994,7 @@ def verify_test_environment(
             return False
         return True
 
-    if _python_runner(tokens):
+    if _python_runner(tokens, allowed_test_paths, required_test_paths):
         ecosystem = "python"
         wrapper, interpreter, runner, framework = _python_verification_parts(
             tokens, verification_python
@@ -1181,7 +1213,36 @@ def _redact_sensitive_values(text: str) -> str:
     return text
 
 
-def sandbox_test_command(command: str) -> str:
+def with_service_env(
+    command: str, env_file: str | None, env_root: str = "/workspace/"
+) -> str:
+    """Wrap a trusted command so sandbox-local service settings are exported.
+
+    ``set -a`` is required because sourcing a plain KEY=value file only creates
+    shell variables; without it the exec'd pytest process would not inherit
+    DATABASE_URL or CACHE_URL. ``env_root`` exists only for isolated testing
+    and defaults to the sandbox-only workspace path in production.
+    """
+    if not env_file:
+        return command
+    if (
+        not isinstance(env_file, str)
+        or not isinstance(env_root, str)
+        or not env_root.startswith("/")
+        or not env_root.endswith("/")
+        or ".." in env_root
+        or not env_file.startswith(env_root)
+        or ".." in env_file
+        or not shlex.split(command)
+    ):
+        raise ValueError("Invalid service env wrapper")
+    script = (
+        f"set -a; . {shlex.quote(env_file)}; set +a; exec \"$0\" \"$@\""
+    )
+    return "/bin/sh -c " + shlex.quote(script) + " " + shlex.join(shlex.split(command))
+
+
+def sandbox_test_command(command: str, service_env_file: str | None = None) -> str:
     """Run tests with only explicitly approved, non-secret environment variables."""
     argv = shlex.split(command)
 
@@ -1201,7 +1262,8 @@ def sandbox_test_command(command: str) -> str:
     for name, value in FORCED_SANDBOX_ENV.items():
         environment_args.append(f"{name}={shlex.quote(value)}")
 
-    return "cd /workspace && " + " ".join(environment_args) + " -- " + shlex.join(argv)
+    final_command = with_service_env(shlex.join(argv), service_env_file)
+    return "cd /workspace && " + " ".join(environment_args) + " -- " + final_command
 
 
 def generated_tests_manifest_from_archive(archive_path: Path) -> dict:
@@ -1693,8 +1755,8 @@ def _diagnosis_was_rejected(report: dict, attempts: list[dict] | None = None) ->
     return False
 
 
-def final_failure_category(report: dict, attempts: list[dict], environment_ready: bool) -> str | None:
-    """Return a reporting category supported by environment and diagnosis evidence."""
+def _resolve_failure_category(report: dict, attempts: list[dict], environment_ready: bool) -> str | None:
+    """Resolve one evidence-backed category shared by all reporting paths."""
     # A genuine environment failure takes precedence over diagnosis evidence.
     if not environment_ready:
         if report.get("dependency_installation_failures"):
@@ -1724,11 +1786,24 @@ def final_failure_category(report: dict, attempts: list[dict], environment_ready
     return "unknown"
 
 
+def failure_categories(
+    report: dict, attempts: list[dict] | None, environment_ready: bool
+) -> tuple[str | None, str]:
+    """Single source of truth for final and workflow failure categories."""
+    final = _resolve_failure_category(report, attempts or [], environment_ready)
+    return final, final or "unknown"
+
+
+def final_failure_category(report: dict, attempts: list[dict], environment_ready: bool) -> str | None:
+    """Return the final reporting category from the shared resolver."""
+    return failure_categories(report, attempts, environment_ready)[0]
+
+
 def workflow_failure_category(
     report: dict, environment_ready: bool, attempts: list[dict] | None = None
 ) -> str:
     """Return the workflow-level category, consistent with the final category."""
-    return final_failure_category(report, attempts or [], environment_ready) or "unknown"
+    return failure_categories(report, attempts, environment_ready)[1]
 
 
 def environment_ready_from_report(report: dict) -> bool:
@@ -1884,8 +1959,11 @@ def _fallback_result_streams(output_dir: Path) -> tuple[str, str]:
     )
 
 
-def _quarantined_tests_from_attempts(attempt_records) -> list[dict]:
-    """Collect quarantined generated tests in the normal artifact's shape."""
+def quarantined_tests_from_attempts(attempt_records) -> list[dict]:
+    """Collect quarantined generated tests in the normal artifact's shape.
+
+    This is the canonical implementation shared with the generator.
+    """
     records = []
     if not isinstance(attempt_records, list):
         return records
@@ -1900,6 +1978,10 @@ def _quarantined_tests_from_attempts(attempt_records) -> list[dict]:
             "status": item.get("quarantine_status"),
         })
     return records
+
+
+# Backward-compatible alias for earlier callers.
+_quarantined_tests_from_attempts = quarantined_tests_from_attempts
 
 
 def ensure_failure_artifacts(
@@ -1977,7 +2059,7 @@ def ensure_failure_artifacts(
     )
     quarantined_tests = report.get("quarantined_tests")
     if not isinstance(quarantined_tests, list) or not quarantined_tests:
-        quarantined_tests = _quarantined_tests_from_attempts(attempt_records)
+        quarantined_tests = quarantined_tests_from_attempts(attempt_records)
     final_category = final_failure_category(report, attempt_records, environment_ready)
     workflow_category = workflow_failure_category(
         report, environment_ready, attempt_records
@@ -2509,6 +2591,8 @@ def validate_repair_diagnosis(report_text: str, attempt: int, output: str) -> di
         "attempt": attempt,
         "reported_category": "unknown",
         "category": "unknown",
+        "affected_file": None,
+        "affected_line": None,
         "evidence": [],
         "root_cause": "",
         "repair_action": "",
@@ -2590,8 +2674,38 @@ def validate_repair_diagnosis(report_text: str, attempt: int, output: str) -> di
             "application repair was not attempted; human review required."
         )
         return result
+    # Preserve a candidate source location only for a validated
+    # application bug/regression. The trusted GitHub publisher will
+    # independently verify it against the PR diff.
+    affected_file = item.get("affected_file")
+    affected_line = item.get("affected_line")
+
+    if (
+        isinstance(affected_file, str)
+        and affected_file.strip()
+        and affected_file == affected_file.strip()
+        and "\\" not in affected_file
+        and not any(
+            ord(char) < 0x20 or ord(char) == 0x7F
+            for char in affected_file
+        )
+        and isinstance(affected_line, int)
+        and not isinstance(affected_line, bool)
+        and affected_line > 0
+    ):
+        source_path = PurePosixPath(affected_file)
+        if (
+            not source_path.is_absolute()
+            and str(source_path) not in {"", "."}
+            and ".." not in source_path.parts
+        ):
+            result["affected_file"] = affected_file
+            result["affected_line"] = affected_line
+
     result["repair_allowed"] = True
-    result["decision_reason"] = "Verified application bug/regression diagnosis; sandbox repair is allowed."
+    result["decision_reason"] = (
+        "Verified application bug/regression diagnosis; sandbox repair is allowed."
+    )
     return result
 
 

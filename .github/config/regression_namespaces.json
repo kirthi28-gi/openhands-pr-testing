@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "repositories": {
+    "kirthi28-gi/openhands-pr-testing": {
+      "metadata_dir": "metadata/openhands-pr-testing",
+      "test_root": "tests/generated/openhands-pr-testing",
+      "archive_namespace": "openhands-pr-testing"
+    },
+    "saleor/saleor": {
+      "metadata_dir": "metadata/saleor",
+      "test_root": "tests/generated/saleor",
+      "archive_namespace": "saleor"
+    }
+  }
+}

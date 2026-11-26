@@ -5,6 +5,34 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
     branches: [main]
+  workflow_dispatch:
+    # Controlled path for testing an approved external repository (Saleor).
+    # Inputs are validated against trusted configuration before checkout.
+    inputs:
+      target_repository:
+        description: "owner/repo of the approved target repository"
+        required: true
+        type: string
+      base_sha:
+        description: "Full 40-character base commit SHA"
+        required: true
+        type: string
+      head_sha:
+        description: "Full 40-character PR head commit SHA"
+        required: true
+        type: string
+      pr_number:
+        description: "Target pull request number"
+        required: true
+        type: string
+      pr_title:
+        description: "Optional PR title"
+        required: false
+        type: string
+      pr_body:
+        description: "Optional PR description"
+        required: false
+        type: string
 
 concurrency:
   group: openhands-test-generation
@@ -23,15 +51,25 @@ jobs:
       - name: Checkout trusted base branch automation
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
           path: trusted
+
+      - name: Validate workflow inputs
+        env:
+          TARGET_REPOSITORY: ${{ inputs.target_repository || github.repository }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          python trusted/.github/scripts/validate_target_repository.py \
+            --automation-dir trusted
 
       - name: Checkout PR source without credentials
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || inputs.target_repository }}
           fetch-depth: 0
           persist-credentials: false
           path: pr-source
@@ -52,24 +90,58 @@ jobs:
           python-version: "3.12"
 
       - name: Prepare approved regression tests
+        env:
+          TARGET_REPOSITORY: ${{ inputs.target_repository || github.repository }}
         run: |
           mkdir -p trusted/regression-input
           python trusted/.github/scripts/prepare_regression_tests.py \
             --regression-repo regression-source \
+            --source-repository "$TARGET_REPOSITORY" \
             --output trusted/regression-input/approved-regression-tests.tar.gz
 
 
       - name: Prepare PR diff
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository || github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           AUTH_HEADER=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $AUTH_HEADER" -C pr-source fetch "https://github.com/${GITHUB_REPOSITORY}.git" "$BASE_SHA"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $AUTH_HEADER" -C pr-source fetch "https://github.com/${TARGET_REPOSITORY}.git" "$BASE_SHA"
           git -C pr-source diff "$BASE_SHA" "$HEAD_SHA" > trusted/pr.diff
           echo "PR diff generated."
           wc -l trusted/pr.diff
+
+      - name: Detect trusted automation drift
+        id: automation_drift
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          CHANGED=$(git -C pr-source diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
+            .github/scripts/generate_tests.py \
+            .github/scripts/pr_test_harness.py \
+            .github/scripts/sandbox_network.py \
+            .github/scripts/package_proxy.py \
+            .github/scripts/prepare_regression_tests.py \
+            .github/scripts/publish_test_results.py \
+            .github/scripts/safe_extract.py \
+            .github/scripts/safe_extract_regression_tests.py \
+            .github/workflows/openhands-test-generation.yml || true)
+          if [ -n "$CHANGED" ]; then
+            {
+              echo "### Trusted automation drift"
+              echo "This PR changes automation files. CI deliberately runs the base-branch copy for security, so these changes are not exercised here."
+              echo "Validate them on the branch before merging."
+              echo "$CHANGED" | sed 's/^/- /'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::PR modifies trusted automation; base-branch automation is used by this run."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install OpenHands SDK
         run: |
@@ -210,12 +282,13 @@ jobs:
           LLM_MODEL: gpt-6-luna
           LLM_BASE_URL: https://api.openai.com/v1
 
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title || inputs.pr_title }}
+          PR_BODY: ${{ github.event.pull_request.body || inputs.pr_body }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
 
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository || github.repository }}
 
           AUTOMATION_DIR: ${{ github.workspace }}/trusted
           PR_SOURCE_DIR: ${{ github.workspace }}/pr-source
@@ -241,3 +314,99 @@ jobs:
             rm -f package-proxy.pid
           fi
           docker rm -f oh-control-probe oh-target-probe >/dev/null 2>&1 || true
+
+  publish-results:
+    # Runs only trusted, base-branch code. The GitHub write token never enters
+    # the OpenHands sandbox or the generate-tests job.
+    needs: generate-tests
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout trusted base branch automation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          path: trusted
+          persist-credentials: false
+
+      - name: Validate workflow inputs
+        env:
+          TARGET_REPOSITORY: ${{ inputs.target_repository || github.repository }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          python trusted/.github/scripts/validate_target_repository.py \
+            --automation-dir trusted
+
+      - name: Download generated-test report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: openhands-generated-tests
+          path: publisher-input
+
+      - name: Ensure a report artifact exists
+        run: |
+          set -euo pipefail
+          if [ ! -f publisher-input/openhands-report.json ]; then
+            mkdir -p publisher-input
+            printf '%s\n' \
+              '{"result":"not run","limitations":["No report artifact was produced."],"failures":[]}' \
+              > publisher-input/openhands-report.json
+          fi
+
+      # The diff is regenerated from trusted event metadata, never read from
+      # the agent-produced artifact, so an agent cannot relocate an inline
+      # comment to a line it did not actually change.
+      - name: Regenerate trusted PR diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository || github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          AUTH_HEADER=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $AUTH_HEADER" \
+            -C trusted fetch --no-tags "https://github.com/${TARGET_REPOSITORY}.git" \
+            "refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+          ACTUAL_HEAD=$(git -C trusted rev-parse refs/remotes/pr/head)
+          if [ "$ACTUAL_HEAD" != "$HEAD_SHA" ]; then
+            echo "PR head SHA does not match workflow event; failing closed."
+            exit 1
+          fi
+          git -C trusted diff "$BASE_SHA" refs/remotes/pr/head > trusted/pr.diff
+          echo "Trusted PR diff regenerated."
+          wc -l trusted/pr.diff
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publish validated results to the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_RESULT: ${{ needs.generate-tests.result }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository || github.repository }}
+        run: |
+          python trusted/.github/scripts/publish_test_results.py \
+            --publish \
+            --report publisher-input/openhands-report.json \
+            --diff trusted/pr.diff \
+            --workflow-result "$WORKFLOW_RESULT" \
+            --repository "$TARGET_REPOSITORY" \
+            --pr-number "$PR_NUMBER" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA"

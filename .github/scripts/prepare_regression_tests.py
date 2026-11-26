@@ -17,6 +17,69 @@ MAX_FILES = 1000
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_TOTAL_SIZE = 50 * 1024 * 1024
 
+REGRESSION_CONFIG = Path(".github/config/regression_namespaces.json")
+LEGACY_NAMESPACE = {
+    "repository": EXPECTED_REPOSITORY,
+    "metadata_dir": METADATA_DIR,
+    "test_root": TEST_ROOT,
+    "archive_namespace": "openhands-pr-testing",
+}
+
+
+def load_namespaces(config_path=None):
+    """Load trusted per-repository regression namespaces."""
+    path = Path(config_path) if config_path else (
+        Path(__file__).resolve().parents[2] / REGRESSION_CONFIG
+    )
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        raise RuntimeError(f"Could not read regression namespaces: {exc}") from exc
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise RuntimeError("Regression namespace config must be a version-1 object")
+    repositories = data.get("repositories", {})
+    if not isinstance(repositories, dict):
+        raise RuntimeError("repositories must be an object")
+
+    namespaces = {}
+    for repository, value in repositories.items():
+        if not isinstance(repository, str) or repository.count("/") != 1 or not repository.strip():
+            raise RuntimeError(f"Invalid repository key: {repository}")
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Namespace must be an object: {repository}")
+        try:
+            metadata_dir = safe_relative_path(value.get("metadata_dir"))
+            test_root = safe_relative_path(value.get("test_root"))
+        except ValueError as exc:
+            raise RuntimeError(f"Unsafe namespace path for {repository}: {exc}") from exc
+        namespace = {
+            "repository": repository,
+            "metadata_dir": metadata_dir,
+            "test_root": test_root,
+            "archive_namespace": value.get("archive_namespace"),
+        }
+        archive = namespace["archive_namespace"]
+        if not isinstance(archive, str) or not archive or "/" in archive or "\\" in archive:
+            raise RuntimeError(f"Invalid archive namespace: {repository}")
+        namespaces[repository] = namespace
+    return namespaces
+
+
+def namespace_for(source_repository=None):
+    """Resolve a trusted namespace; unknown repositories fail closed."""
+    if source_repository in (None, ""):
+        return dict(LEGACY_NAMESPACE)
+    namespaces = load_namespaces()
+    if source_repository in namespaces:
+        return namespaces[source_repository]
+    if source_repository == EXPECTED_REPOSITORY:
+        return dict(LEGACY_NAMESPACE)
+    raise RuntimeError(
+        f"No approved regression namespace for source repository: {source_repository}"
+    )
+
 
 def safe_relative_path(value):
     if not isinstance(value, str) or not value:
@@ -30,11 +93,13 @@ def safe_relative_path(value):
     return path
 
 
-def prepare(regression_repo, output):
+def prepare(regression_repo, output, source_repository=None):
     regression_repo = regression_repo.resolve()
     output = output.resolve()
+    namespace = namespace_for(source_repository)
+    expected_repository = namespace["repository"]
 
-    metadata_root = regression_repo / METADATA_DIR
+    metadata_root = regression_repo / namespace["metadata_dir"]
     if not metadata_root.is_dir():
         raise RuntimeError(f"Missing metadata directory: {metadata_root}")
 
@@ -60,7 +125,7 @@ def prepare(regression_repo, output):
             skipped += 1
             continue
 
-        if metadata.get("source_repository") != EXPECTED_REPOSITORY:
+        if metadata.get("source_repository") != expected_repository:
             raise RuntimeError(
                 f"Unexpected source repository in {metadata_file.name}"
             )
@@ -80,7 +145,7 @@ def prepare(regression_repo, output):
                 f"Approved metadata has no test_files: {metadata_file.name}"
             )
 
-        expected_prefix = TEST_ROOT / f"PR-{pr_number}"
+        expected_prefix = namespace["test_root"] / f"PR-{pr_number}"
 
         for entry in files:
             relative = safe_relative_path(entry)
@@ -111,7 +176,8 @@ def prepare(regression_repo, output):
                 raise RuntimeError(f"Binary test file is not allowed: {entry}")
 
             archive_name = (
-                Path("tests/regression/openhands-pr-testing")
+                Path("tests/regression")
+                / namespace["archive_namespace"]
                 / f"PR-{pr_number}"
                 / relative.name
             ).as_posix()
@@ -152,9 +218,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--regression-repo", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--source-repository",
+        default=None,
+        help="Repository whose approved tests are being prepared.",
+    )
     args = parser.parse_args()
 
-    prepare(args.regression_repo, args.output)
+    prepare(args.regression_repo, args.output, args.source_repository)
 
 
 if __name__ == "__main__":

@@ -278,3 +278,190 @@ def test_final_report_normalization_preserves_unrelated_fields():
     assert normalized["root_causes"] == original["root_causes"]
     assert normalized["verified_test_results"] == original["verified_test_results"]
     assert normalized["failures"][0]["root_cause_evidence"] == original["failures"][0]["root_cause_evidence"]
+
+
+def test_schema_hint_requests_optional_verified_application_source_location():
+    hint = gt.SCHEMA_HINT
+    assert "affected_file" in hint
+    assert "affected_line" in hint
+    assert "application_bug" in hint
+    assert "regression" in hint
+    assert "null" in hint
+
+
+def test_validated_application_diagnosis_copies_source_location():
+    report = {
+        "failures": [{
+            "attempt": 1,
+            "category": "unknown",
+            "affected_file": "untrusted/raw.py",
+            "affected_line": 999,
+        }]
+    }
+    attempts = [{
+        "attempt": 1,
+        "diagnosis": {
+            "validated": True,
+            "category": "application bug",
+            "evidence": ["E AssertionError: expected 3, got 2"],
+            "root_cause": "Incorrect addition result.",
+            "failing_test": "tests/test_math.py::test_add",
+            "root_cause_evidence": ["E AssertionError: expected 3, got 2"],
+            "affected_file": "src/math.py",
+            "affected_line": 42,
+        },
+    }]
+
+    gates = gt.apply_validated_diagnoses(report, attempts)
+
+    failure = report["failures"][0]
+    assert gates[1]["diagnosis"]["validated"] is True
+    assert failure["category"] == "application bug"
+    assert failure["affected_file"] == "src/math.py"
+    assert failure["affected_line"] == 42
+
+
+def test_unvalidated_diagnosis_cannot_publish_raw_source_location():
+    report = {
+        "failures": [{
+            "attempt": 1,
+            "category": "application_bug",
+            "affected_file": "untrusted/raw.py",
+            "affected_line": 999,
+        }]
+    }
+    attempts = [{
+        "attempt": 1,
+        "diagnosis": {
+            "validated": False,
+            "category": "application bug",
+            "affected_file": "untrusted/raw.py",
+            "affected_line": 999,
+        },
+    }]
+
+    gt.apply_validated_diagnoses(report, attempts)
+
+    failure = report["failures"][0]
+    assert failure["category"] == "unknown"
+    assert "affected_file" not in failure
+    assert "affected_line" not in failure
+
+
+def test_validated_non_application_diagnosis_does_not_copy_source_location():
+    report = {
+        "failures": [{
+            "attempt": 1,
+            "category": "unknown",
+            "affected_file": "untrusted/raw.py",
+            "affected_line": 999,
+        }]
+    }
+    attempts = [{
+        "attempt": 1,
+        "diagnosis": {
+            "validated": True,
+            "category": "incorrect test",
+            "affected_file": "tests/test_math.py",
+            "affected_line": 12,
+        },
+    }]
+
+    gt.apply_validated_diagnoses(report, attempts)
+
+    failure = report["failures"][0]
+    assert failure["category"] == "incorrect test"
+    assert "affected_file" not in failure
+    assert "affected_line" not in failure
+
+
+def test_validated_application_diagnosis_without_location_remains_valid():
+    report = {
+        "failures": [{
+            "attempt": 1,
+            "category": "unknown",
+            "affected_file": "untrusted/raw.py",
+            "affected_line": 999,
+        }]
+    }
+    attempts = [{
+        "attempt": 1,
+        "diagnosis": {
+            "validated": True,
+            "category": "regression",
+            "evidence": ["E AssertionError: expected 3, got 2"],
+            "root_cause": "A regression changed the result.",
+            "failing_test": "tests/test_math.py::test_add",
+            "root_cause_evidence": ["E AssertionError: expected 3, got 2"],
+            "affected_file": None,
+            "affected_line": None,
+        },
+    }]
+
+    gt.apply_validated_diagnoses(report, attempts)
+
+    failure = report["failures"][0]
+    assert failure["category"] == "regression"
+    assert "affected_file" not in failure
+    assert "affected_line" not in failure
+
+
+def test_agent_validation_flags_cannot_override_invalid_evidence(tmp_path):
+    report = _final_report(["E AssertionError: expected 99, got 2"])
+    report.update({
+        "agent_report_valid": True,
+        "report_valid": True,
+        "report_validation_errors": [],
+    })
+    normalized = json.loads(gt.normalize_final_agent_report(json.dumps(report), ATTEMPTS))
+    assert normalized["agent_report_valid"] is True
+    assert normalized["report_validation_errors"] == []
+
+    path = tmp_path / "openhands-report.json"
+    path.write_text(json.dumps(normalized), encoding="utf-8")
+    validated = load_agent_report(path, ATTEMPTS)
+
+    assert "agent_report_valid" not in validated
+    assert "report_valid" not in validated
+    assert any(
+        "does not match captured output" in error
+        for error in validated["report_validation_errors"]
+    )
+    gt.finalize_report_validity(validated, True)
+    assert validated["agent_report_valid"] is False
+    assert validated["report_valid"] is False
+
+
+def test_agent_empty_validation_errors_cannot_hide_schema_failure(tmp_path):
+    report = _final_report(["tests/test_math.py::test_add"])
+    del report["blockers"]
+    report.update({"report_valid": True, "report_validation_errors": []})
+
+    normalized = json.loads(gt.normalize_final_agent_report(json.dumps(report), ATTEMPTS))
+    path = tmp_path / "openhands-report.json"
+    path.write_text(json.dumps(normalized), encoding="utf-8")
+    validated = load_agent_report(path, ATTEMPTS)
+
+    assert any(
+        "missing required field: blockers" in error
+        for error in validated["report_validation_errors"]
+    )
+    gt.finalize_report_validity(validated, True)
+    assert validated["agent_report_valid"] is False
+    assert validated["report_valid"] is False
+
+
+def test_missing_or_malformed_report_fails_closed(tmp_path):
+    path = tmp_path / "openhands-report.json"
+    for content in (None, "not json", "[]", '{"schema_version": 1}'):
+        if content is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(content, encoding="utf-8")
+
+        validated = load_agent_report(path, ATTEMPTS)
+        assert validated["report_validation_errors"]
+        assert validated["failures"] == []
+        gt.finalize_report_validity(validated, True)
+        assert validated["agent_report_valid"] is False
+        assert validated["report_valid"] is False
