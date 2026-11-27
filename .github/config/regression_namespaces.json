@@ -10,6 +10,11 @@
       "metadata_dir": "metadata/saleor",
       "test_root": "tests/generated/saleor",
       "archive_namespace": "saleor"
+    },
+    "kirthi28-gi/saleor": {
+      "metadata_dir": "metadata/kirthi28-gi-saleor",
+      "test_root": "tests/generated/kirthi28-gi-saleor",
+      "archive_namespace": "kirthi28-gi-saleor"
     }
   }
 }

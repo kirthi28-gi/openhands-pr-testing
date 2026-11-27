@@ -3,9 +3,25 @@
   "profiles": {
     "saleor/saleor": {
       "targeted_test_paths": {
-        "saleor/core/cleaners/": ["saleor/core/cleaners/tests/"]
+        "saleor/core/cleaners/": [
+          "saleor/core/cleaners/tests/"
+        ]
       },
-      "always_test_paths": ["tests/generated"],
+      "always_test_paths": [
+        "tests/generated"
+      ],
+      "service_profile": "postgres_valkey_local",
+      "generated_test_conftest": ".github/config/saleor/generated_conftest.py"
+    },
+    "kirthi28-gi/saleor": {
+      "targeted_test_paths": {
+        "saleor/core/cleaners/": [
+          "saleor/core/cleaners/tests/"
+        ]
+      },
+      "always_test_paths": [
+        "tests/generated"
+      ],
       "service_profile": "postgres_valkey_local",
       "generated_test_conftest": ".github/config/saleor/generated_conftest.py"
     }
